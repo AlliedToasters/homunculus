@@ -26,7 +26,7 @@ Returns current player inventory. Sparse — only occupied slots returned. Schem
 
 Items expose `id` and `count` only — no NBT / components / durability in v1. Damaged tools and enchanted items appear identical to pristine versions. Known limitation, deferred.
 
-### `GET /position` *(new — world state)*
+### `GET /position` *(implemented)*
 
 Returns the player's world-space position and orientation. No body.
 
@@ -47,7 +47,7 @@ All values are doubles. Coordinates are world-absolute (block-fractional, not bl
 - `bad_request` — wrong HTTP method (e.g. POST to a GET endpoint). 4xx.
 - `internal_error` — no player (title screen, mid-respawn) or anything unexpected. 5xx.
 
-### `GET /scan_column` *(new — world state)*
+### `GET /scan_column` *(implemented)*
 
 For a given (x, z) column, returns the surface-y — the y a player would stand at to be on top of the column with open sky above. Used by the agent's `surface` recovery primitive (escape from a cave or self-dug pit) and by any other "where's daylight" decision.
 
@@ -72,7 +72,7 @@ For a given (x, z) column, returns the surface-y — the y a player would stand 
 - `out_of_range` — requested (x, z) is outside loaded chunks. The default-column request never fires this; only an explicit `x, z` far from the player can.
 - `internal_error` — anything unexpected.
 
-### `GET /scan_entities` *(planned — world state)*
+### `GET /scan_entities` *(implemented)*
 
 Returns nearby entities matching a type filter, sorted by distance from the player. The agent's hunt / combat tooling uses this to find a target before pathing to it — Wurst's KillAura + Baritone's item pickup handle the rest of the harvest loop, so the only thing missing from the craft side is "where is the nearest cow." This endpoint fills that gap.
 
@@ -196,7 +196,7 @@ Fields:
 - No raw attribute map (movement speed, knockback resistance, etc.). Agent doesn't need it for the diamond-goal harness.
 - No client-side latency ping. If the agent needs that, add a dedicated endpoint.
 
-### `GET /deaths` *(planned — world state)*
+### `GET /deaths` *(implemented)*
 
 Returns a buffer of recent player deaths. The agent polls this after each tool call so it can detect a death (which silently wipes inventory and teleports the player), surface the cause into the LLM's context, and optionally route back to the corpse via `/baritone/goto`.
 
@@ -418,7 +418,7 @@ Plus armor slots: head, chest, legs, feet.
 
 **Failure response:** standard `{success:false, reason, message}`. `reason` is one of `internal_error` (no player, screen open, packet failure).
 
-### `POST /smelt` *(planned, not yet implemented)*
+### `POST /smelt` *(implemented)*
 
 Run a furnace smelt for `count` outputs of an item, using fuel from inventory. Mirrors `/craft`'s shape: structured, atomic, sync.
 
@@ -474,18 +474,252 @@ Mod behavior:
 
 **Always include `requires_furnace` and `furnace_nearby` regardless of failure reason** — same convention as `/craft`'s table fields.
 
-**Auto-fuel ranking (when `fuel` is omitted).** The selector **accumulates fuel across types** until the burn budget is covered, walking cheap → expensive:
-- Tier order: `stick`, `*_sapling`, `*_planks`, `*_log` / `*_stem`, `charcoal`, `coal`, `coal_block`, `lava_bucket`.
+**Auto-fuel ranking (when `fuel` is omitted).** The selector **accumulates fuel across types** until the burn budget is covered, walking by **least crafting-potential loss** (not by burn-time). The intent: preserve wood for the crafting DAG; burn pure-fuel first.
+
+| Tier (high pref → low pref) | Items                                        | Rationale                                                                |
+|-----------------------------|----------------------------------------------|--------------------------------------------------------------------------|
+| 1                           | `coal_block`, `lava_bucket`                  | Dense pure-fuel. `coal_block` is 9 coal compressed.                      |
+| 2                           | `coal`, `charcoal`                           | Pure fuel; no non-smelt use.                                             |
+| 3                           | `stick`                                      | Low crafting-input value (sticks are outputs of planks, rarely an input). |
+| 4                           | `*_sapling`                                  | Zero crafting-input value; only use is planting (agent doesn't farm in v1). |
+| 5                           | `*_planks`                                   | Common crafting input (tables, sticks, doors, …).                        |
+| 6                           | `*_log`, `*_stem`                            | Heaviest crafting input — each log → 4 planks → 8 sticks downstream.     |
+
 - Within a tier, larger stacks are taken first (ties broken by item id for determinism).
-- If the furnace already has a valid pre-loaded fuel, that fuel is used first to avoid pointless eviction.
-- The selector only advances to the next tier when the current tier's available pieces don't close the remaining burn-tick deficit. So an agent holding `1×charcoal + 2×planks + 2×logs` (≈14 smelts' worth combined) can run a 10-smelt request without needing any single type to cover the budget alone.
-- Burn-time table (vanilla, ticks): stick=100 (0.5 smelts), sapling=100 (0.5), planks=300 (1.5), log/stem=300 (1.5), charcoal=1600 (8), coal=1600 (8), coal_block=16000 (80), lava_bucket=20000 (100).
-- When the selector still can't cover the budget, the `missing_fuel` response names the cheapest fuel the player already has (or `oak_planks` if they have none) at the count needed to close the gap. The `missing` array reflects the **actual shortfall**, not an arbitrary fuel suggestion.
+- If the furnace already has a valid pre-loaded fuel, that fuel is used first to avoid pointless eviction — even if it sits in a lower-preference tier.
+- The selector only advances to the next tier when the current tier's available pieces don't close the remaining burn-tick deficit. So an agent holding `1×coal + 2×planks + 2×logs` (≈14 smelts' worth combined) can run a 10-smelt request without needing any single type to cover the budget alone — and will exhaust coal before touching planks/logs.
+- Burn-time table (vanilla, ticks): stick=100 (0.5 smelts), sapling=100 (0.5), planks=300 (1.5), log/stem=300 (1.5), charcoal=1600 (8), coal=1600 (8), coal_block=16000 (80), lava_bucket=20000 (100). Note that burn-time is **not** the ranking key — opportunity cost is.
+- When the selector still can't cover the budget, the `missing_fuel` response names the highest-preference fuel the player already has (or `oak_planks` if they have none) at the count needed to close the gap. The `missing` array reflects the **actual shortfall**, not an arbitrary fuel suggestion.
 - The agent can always force a specific fuel by passing `fuel` explicitly; that path is single-type and will fail with `missing_fuel` if a single stack can't cover the budget.
+- Fuels outside this tier list (e.g. bamboo, wool, planks-derived blocks like bookshelves) are **not** auto-selected. Pass them via the explicit `fuel` param if needed.
 
 **Timing note.** Smelting takes ~10s per output (200 ticks). Synchronous request blocks for `~10s × count + setup overhead`. Caller HTTP timeout must accommodate — recommend `max(30, count * 12)` seconds. Mod should still cap internally (e.g., 5min) to avoid hung connections.
 
 **Atomicity caveat.** True atomicity is best-effort: if the mod crashes mid-batch, the furnace may retain partially-smelted state. On clean failures (validation or "furnace got broken / interrupted"), the mod should not leave items stranded — withdraw any pending input and report the failure. Document anything that can leave partial state.
+
+---
+
+### Async smelt redesign *(planned — v1.2)*
+
+**Why.** The v1.1 `POST /smelt` blocks for `~10s × count` while the furnace ticks down. That's correct as a single atomic operation but wrong as an *agent loop primitive*: the agent's turn freezes, the player stands idle and exposed, and during 2026-05-11 hostile-mode rollouts this directly caused a "died mid-cook" with full material loss. In MC reality smelting is fire-and-forget — load the furnace and do other things. The agent's tool surface should mirror that.
+
+**Shape.** `POST /smelt` becomes non-blocking: it does only the synchronous parts (validate, auto-place a furnace if none is within reach, load input + fuel, ignite) and returns immediately with a registry handle. The cook ticks asynchronously on the game thread. A new `GET /smelt_status` reports per-furnace progress, and `POST /collect_smelt` walks the player to a furnace and pulls finished outputs. The agent decides when to collect.
+
+**Implementation order.** `/collect_smelt` depends on `/baritone/goto` for routing back to a registered furnace, so the wiring order is fixed: `/baritone/goto` first, then the smelt redesign. Until goto is wired, `/collect_smelt` cannot be implemented — the registry + `/smelt_status` could land independently, but shipping the half-redesign without collection would force the agent to walk to furnaces manually, which is exactly the friction this design eliminates.
+
+#### `POST /smelt` *(redesign)*
+
+Same request body as v1.1. New behavior:
+
+1. Validate input/fuel availability (same as v1.1: recipe lookup, count cap, fuel budget).
+2. Find a placed furnace within reach (~4 blocks, same proximity rule as v1.1). If none, **auto-place from inventory**: requires `minecraft:furnace` in the player's inventory, then invokes the same `Placer` path as `/place` (ring-2 preference, anti-casing precondition: ≥6 of 8 ring-1 tiles open). Placement failures roll up as `/smelt` failures with the placement reason (`no_space`, `no_placeable_spot`, `not_in_inventory`). The newly-placed furnace becomes the target.
+3. Open the furnace UI on the game thread, transfer input + fuel into the appropriate slots, light it.
+4. **Register the smelt** in the in-process furnace registry keyed by furnace `BlockPos`. Record: input id+count, expected output id+count, fuel loaded, `started_at_ms`, expected `eta_seconds`.
+5. Close the UI and return immediately — **do not wait for the cook to finish**.
+
+Success response:
+```json
+{
+  "success": true,
+  "furnace_pos": [12, 64, -3],
+  "input": {"id": "minecraft:raw_iron", "count": 9},
+  "expected_output": {"id": "minecraft:iron_ingot", "count": 9},
+  "fuel_loaded": [{"id": "minecraft:coal", "count": 2}],
+  "eta_seconds": 90,
+  "status": "cooking",
+  "started_at_ms": 1715478123456
+}
+```
+
+Synchronous failure reasons. Note that with auto-placement folded into step 2, `requires_furnace` from v1.1 splits into placement-specific reasons. The `requires_furnace` / `furnace_nearby` always-present hint fields from v1.1 do **not** carry into the redesign — the failure reason is precise enough on its own.
+
+- `missing_input` / `missing_fuel` — same as v1.1.
+- `no_recipe` / `unknown_item` — same as v1.1.
+- `not_in_inventory` — no furnace within reach and the player has no `minecraft:furnace` in inventory to auto-place. Agent must craft one.
+- `no_space` — auto-placement tried, anti-casing tripped: fewer than 6 of 8 ring-1 tiles around the player are open. Agent must relocate.
+- `no_placeable_spot` — auto-placement tried, anti-casing passed, but no candidate cell had sturdy support below. Agent must relocate.
+- `internal_error` — anything else.
+
+The "started but cook failed" path is **not** a `/smelt` failure — the cook is async; whatever goes wrong post-ignition surfaces through `/smelt_status` and `/collect_smelt`.
+
+`status` enum on the registry entry:
+- `cooking` — actively ticking; chunk loaded; ETA is live.
+- `ready` — all outputs done; awaiting collection.
+- `partial` — some output ready, some still cooking (e.g. fuel ran out part-way).
+- `stale` — the furnace's chunk is unloaded; the mod can no longer observe tick state. `/smelt_status` reports the last known snapshot and a `last_observed_ms` timestamp instead of a live ETA. The entry stays alive until `/collect_smelt` walks the player back, re-observes the actual furnace, and reconciles (typically transitions to `ready` / `partial` / `cooking`).
+- `destroyed` — furnace block is gone (broken by player/mob/creeper) and last-known chunk was loaded. Exposed once in `/smelt_status` then dropped.
+- `empty` — cleanup pending: output collected and no input remains. Dropped immediately after surfacing once.
+
+#### `GET /smelt_status` *(new)*
+
+Report the state of every registered active smelt. No query params. Read-only.
+
+Response:
+```json
+{
+  "smelts": [
+    {
+      "furnace_pos": [12, 64, -3],
+      "input": {"id": "minecraft:raw_iron", "count_remaining": 0},
+      "output": {"id": "minecraft:iron_ingot", "count_ready": 9},
+      "fuel_remaining_burns": 0,
+      "cook_progress": 1.0,
+      "eta_seconds": 0,
+      "status": "ready"
+    },
+    {
+      "furnace_pos": [5, 15, 8],
+      "input": {"id": "minecraft:raw_copper", "count_remaining": 4},
+      "output": {"id": "minecraft:copper_ingot", "count_ready": 3},
+      "fuel_remaining_burns": 5,
+      "cook_progress": 0.43,
+      "eta_seconds": 41,
+      "status": "cooking"
+    }
+  ]
+}
+```
+
+Field notes:
+- `cook_progress` is a 0..1 estimate over the *total* batch (not per-item). Useful for surfacing progress in the agent's per-turn context.
+- `eta_seconds` is the wall-clock estimate to reach `status=ready` from now. May undercount if the furnace runs out of fuel — implementer should recompute on each tick using fuel-remaining + items-remaining. For `status=stale`, `eta_seconds` is **null** (last-observed ETA is no longer trustworthy; the tick clock paused at chunk-unload).
+- `count_ready` is what `collect_smelt` would currently pull. For a partially-completed batch (fuel exhausted mid-cook), `count_ready < expected_output.count` and `count_remaining > 0`.
+- `status=stale` entries include a `last_observed_ms` field (epoch ms of last live observation) and the last-known `count_ready` / `count_remaining` / `fuel_remaining_burns` values. The mod cannot update these while the chunk is unloaded; `/collect_smelt` will reconcile on arrival.
+- `status=destroyed` entries appear in one response and are then dropped — the agent gets one chance to learn the loss.
+- `status=empty` entries are dropped immediately after `collect_smelt` succeeds; they should not appear in normal `/smelt_status` responses.
+
+Empty registry → `{"smelts": []}`. Clients should treat absence of the field as equivalent to empty.
+
+#### `POST /collect_smelt` *(new)*
+
+Walk the player to an active furnace and transfer ready outputs into inventory. Optional `furnace_pos` targets a specific furnace; otherwise the mod picks the closest registered smelt with `status ∈ {ready, partial, stale}` (stale entries are eligible — reconciliation on arrival decides whether anything's actually collectable).
+
+Request body (all fields optional):
+```json
+{"furnace_pos": [12, 64, -3]}
+```
+
+Mod behavior:
+1. If `furnace_pos` is provided, look it up in the registry. If absent or not in registry, return `not_in_registry`.
+2. If `furnace_pos` is omitted, select the closest registered furnace with `status ∈ {ready, partial, stale}`. If none, return `no_active_smelts`. (Stale entries are eligible targets — the agent's intent to collect implies "please route there and reconcile.")
+3. Route the player to the furnace via `/baritone/goto` (same proximity rule as `/craft`'s `crafting_table_nearby` — within reach). If goto fails, return `furnace_unreachable`.
+4. **Reconcile on arrival.** Once within reach, the chunk is loaded again. Read the furnace BlockEntity directly to refresh `count_ready`, `count_remaining`, `fuel_remaining_burns`, and recompute `status` (`stale` → `cooking` / `ready` / `partial` / `destroyed`). The pre-reconciliation status drove the routing decision; the post-reconciliation status drives the actual collection.
+5. Open the furnace UI on the game thread, transfer the output slot to inventory, close UI.
+6. If the furnace block is no longer a furnace (broken since last tick or while the chunk was unloaded), return `furnace_destroyed` and drop the registry entry.
+7. After successful collection: if input remaining is 0 and output slot is empty, drop the registry entry and return `status: empty`. Otherwise leave the entry to keep cooking; return `status: cooking` or `partial`.
+
+Success response:
+```json
+{
+  "success": true,
+  "furnace_pos": [12, 64, -3],
+  "collected": [{"id": "minecraft:iron_ingot", "count": 9}],
+  "still_cooking": 0,
+  "fuel_remaining_burns": 0,
+  "status": "empty"
+}
+```
+
+Partial-collection example (3 iron pulled, 4 raw_iron still cooking):
+```json
+{
+  "success": true,
+  "furnace_pos": [5, 15, 8],
+  "collected": [{"id": "minecraft:copper_ingot", "count": 3}],
+  "still_cooking": 4,
+  "eta_seconds": 41,
+  "status": "cooking"
+}
+```
+
+Failure reasons:
+- `no_active_smelts` — registry has no `ready`/`partial`/`stale` smelts and no `furnace_pos` was specified.
+- `not_in_registry` — the requested `furnace_pos` isn't a registered smelt.
+- `furnace_unreachable` — `/baritone/goto` couldn't route to the furnace within budget. Caller can retry, travel closer manually, or give up.
+- `furnace_destroyed` — registry entry exists but the world block isn't a furnace anymore (broken since last tick, or broken while the chunk was unloaded — surfaces on reconciliation for stale entries). Entry is dropped.
+- `nothing_ready` — reconciliation revealed the furnace is still actively `cooking` with `count_ready == 0`. The agent walked all the way there for nothing. Rare for non-stale targets (the registry shouldn't route to a `cooking`-status entry); common-ish for stale entries whose chunks unloaded mid-cook.
+- `internal_error` — anything else.
+
+#### Furnace registry
+
+In-process state owned by the mod, keyed by `BlockPos`. One entry per agent-initiated smelt that hasn't been fully collected.
+
+Persistence:
+- **Survives player death.** Furnaces are world blocks; the items inside are world state. The player respawns elsewhere but the furnace + its contents persist. A registry entry for a smelt that started before death should still be visible in `/smelt_status` after respawn, and `collect_smelt` should be able to route back to it.
+- **Survives chunk unload as `stale`.** When a registered furnace's chunk unloads (agent travels far, dimension change), the mod can no longer tick its state. The entry transitions to `status=stale`, snapshotting `last_observed_ms` and the last known progress fields. When the chunk reloads — either incidentally (agent wanders back into render distance) or deliberately (`/collect_smelt` routes there) — the mod re-observes the furnace BlockEntity and reconciles. Reconciliation outcomes: `cooking` (still progressing), `ready` / `partial` (cook completed during the unload), `destroyed` (furnace block is gone). Incidental reloads update the entry in place; deliberate reloads via `/collect_smelt` reconcile then collect.
+- **Does not survive mod restart.** Registry is in-memory only. If homunculus restarts, registered smelts are forgotten. The furnaces themselves and their items remain in the world but the agent can't differentiate them from random world furnaces. This is acceptable for v1.2; persistence-to-disk is a v1.3+ concern.
+- **Does not survive dimension change of the agent's perspective on a *different* registered furnace.** Each registry entry stores the dimension id alongside `BlockPos`; the cross-dimension case is the same as chunk-unload (entry transitions to `stale`). `/collect_smelt` against a stale entry in another dimension fails with `furnace_unreachable` (goto doesn't cross dimensions in v1).
+- **Cleanup paths:**
+  - `collect_smelt` empties a furnace → registry entry dropped.
+  - Furnace block destroyed while chunk loaded (creeper, player breaks it) → `status=destroyed` exposed in next `/smelt_status` response, then dropped.
+  - Furnace destroyed while chunk unloaded → entry sits as `stale` until reconciliation surfaces `destroyed`, then dropped.
+  - Abandoned entries (no progress in >10 min and `status=cooking` with `fuel_remaining_burns == 0`) → optionally garbage-collect; not required for v1.2 correctness.
+
+Multiple concurrent smelts allowed. The agent can fire-and-forget several furnaces in parallel, do other work, then collect each one when ready.
+
+#### Consumer-side sketch (craft/)
+
+The craft-side change is in two places: the `smelt`/`collect_smelt` tool handlers (`tools.py`) and the per-turn context fetcher (`agent.py`).
+
+**Tool surface** (`tools.py`):
+
+```python
+# smelt: no signature change; new semantics (returns immediately).
+def handle_smelt(args):
+    # ... same placement/auto-fuel logic on the synchronous path ...
+    resp = POST /smelt {...}
+    if not resp.success:
+        return structured_error(resp)  # unchanged
+    # NEW: return immediately with the registry handle
+    pos = resp.furnace_pos
+    eta = resp.eta_seconds
+    return (
+        f"smelt started: {count}x {input} in furnace at "
+        f"({pos[0]},{pos[1]},{pos[2]}); ETA ~{eta}s. "
+        f"Continue with other actions; call collect_smelt() when ready."
+    )
+
+# collect_smelt: new tool, no required args.
+def handle_collect_smelt(args):
+    pos = args.get("furnace_pos")  # optional
+    body = {"furnace_pos": pos} if pos else {}
+    resp = POST /collect_smelt body
+    if not resp.success:
+        reason = resp.reason
+        if reason == "no_active_smelts":
+            return "no active smelts to collect from — call smelt() first"
+        if reason == "furnace_unreachable":
+            return f"FAILED: couldn't reach furnace at {pos}; try travel() closer"
+        if reason == "furnace_destroyed":
+            return f"FAILED: furnace at {pos} is destroyed — smelted items are lost"
+        return f"FAILED: collect_smelt: {resp.message}"
+    collected = ", ".join(f"{c['count']}x {c['id']}" for c in resp.collected)
+    rest = f"; {resp.still_cooking} still cooking (~{resp.eta_seconds}s)" if resp.still_cooking else ""
+    return f"collected: {collected}{rest}"
+```
+
+**Per-turn context** (`agent.py`): a new `_fetch_smelts()` helper, called alongside `_fetch_stats()` and `_fetch_inventory()` each turn. Renders as:
+
+```
+Active smelts:
+  furnace (12,64,-3): 9x iron_ingot READY — call collect_smelt()
+  furnace (5,15,8):   3x copper_ingot ready, 4x raw_copper cooking (~41s)
+```
+
+Omitted entirely when the registry is empty (don't pollute the prompt with "no active smelts").
+
+**Prompt updates**:
+- Add `collect_smelt(furnace_pos?)` to the tool list with description: "Retrieve outputs from your active smelting furnace(s). Call after smelt() returns 'started', once 'Active smelts' shows READY."
+- Update `smelt()` description: "Load a furnace and ignite it; returns IMMEDIATELY. Cook runs asynchronously (~10s per item). Use collect_smelt() in a later turn to retrieve outputs."
+
+**Death-recovery integration**: smelts survive death, so the YOU DIED preamble doesn't need to mention them — the per-turn `_fetch_smelts()` will surface them naturally on the post-respawn turn, and the agent can goto/collect_smelt as a follow-up. (The "INVENTORY IS EMPTY" anchor still applies; ingots in a furnace are not in inventory.)
+
+#### Open design decisions
+
+- **`location` parameter on `smelt`** is still useful (`home` vs `here` vs `auto`) for the synchronous placement phase. No change to semantics.
+- **`fuel_remaining_burns` granularity**: report in "smelt cycles remaining," not ticks. Easier for the agent to reason about.
+- **Should `collect_smelt` accept a "force partial" flag** to pull a still-cooking furnace's output and stop the cook? Probably yes (allows recovery from "wrong recipe started"), but defer to v1.3 if not requested.
+- **Should the agent be able to add more input** to an actively cooking furnace? Useful for "I have more raw_iron now" — but the natural alternative is "call smelt() again, it'll place a second furnace." Defer.
 
 ### `POST /baritone/mine`
 
@@ -554,7 +788,7 @@ Fields:
 
 **Off-thread BOM prewarm.** `BlockOptionalMeta`'s constructor calls `getStackHashes() → drops()`, which on a multiplayer client deadlocks the render thread: `drops()` is `static synchronized` and invokes `ServerLevelStub.holder() → method_30349 → CompletableFuture.join` on a registry future that requires the render thread itself to make progress. Constructing the BOM from the HTTP worker thread sidesteps this — the render thread stays free to drive the future. Once `drops()` populates its class-level cache for a given block, subsequent constructions of the same block are cheap and safe on any thread. We then pass the prebuilt BOM into `mineProcess.mine(int, BlockOptionalMeta...)`, avoiding the `mine(int, Block...)` overload which would reconstruct a BOM internally on the render thread. Validated 2026-05-11: 3-log cumulative mine completed in 3.6s end-to-end with no MC freeze.
 
-### `POST /baritone/goto` *(planned — retires xdotool path)*
+### `POST /baritone/goto` *(implemented)*
 
 Drive Baritone's `customGoalProcess` to a world-space coordinate and wait for arrival. Replaces direct chat-injection of `#goto x y z` in `craft/tools.py` (used by `surface`, `descend`, `travel`, and `_goto_home`).
 

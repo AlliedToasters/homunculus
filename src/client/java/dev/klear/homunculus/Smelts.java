@@ -296,21 +296,24 @@ public final class Smelts {
 
 	// --- Fuel ranking ---
 
+	// Ordered high-preference (burn first) → low-preference (preserve). Pick the fuel whose loss
+	// costs the least crafting potential, not the fuel that yields the most smelts. Coal_block /
+	// lava_bucket are pure fuel — burning them strands no recipe. Logs are at the bottom because
+	// each log → 4 planks → 8 sticks downstream, so a burned log is a deep crafting-DAG loss.
 	private static final List<Predicate<ResourceLocation>> FUEL_TIERS = List.of(
+			id -> id.getPath().equals("coal_block") || id.getPath().equals("lava_bucket"),
+			id -> id.getPath().equals("coal") || id.getPath().equals("charcoal"),
 			id -> id.getPath().equals("stick"),
 			id -> id.getPath().endsWith("_sapling"),
 			id -> id.getPath().endsWith("_planks"),
-			id -> id.getPath().endsWith("_log") || id.getPath().endsWith("_stem"),
-			id -> id.getPath().equals("charcoal"),
-			id -> id.getPath().equals("coal"),
-			id -> id.getPath().equals("coal_block"),
-			id -> id.getPath().equals("lava_bucket")
+			id -> id.getPath().endsWith("_log") || id.getPath().endsWith("_stem")
 	);
 
 	/**
-	 * Accumulating fuel selection. Walks tiers cheap → expensive, adding components until the burn
-	 * budget closes. The pre-loaded slot (if a valid fuel) is consumed first to avoid pointless
-	 * eviction. Within a tier, larger stacks are preferred and ties broken by id for determinism.
+	 * Accumulating fuel selection. Walks tiers by least-crafting-potential-loss (see FUEL_TIERS),
+	 * adding components until the burn budget closes. The pre-loaded slot (if a valid fuel) is
+	 * consumed first to avoid pointless eviction. Within a tier, larger stacks are preferred and
+	 * ties broken by id for determinism.
 	 *
 	 * Returns null when even the player's full fuel stock doesn't cover the budget. The caller is
 	 * responsible for building a {@code missing_fuel} failure with the residual gap.
@@ -342,7 +345,7 @@ public final class Smelts {
 			}
 		}
 
-		// Priority 2: tiered cheap-first accumulation from inventory.
+		// Priority 2: tiered accumulation from inventory, walking least-crafting-loss → most.
 		for (Predicate<ResourceLocation> tier : FUEL_TIERS) {
 			List<Map.Entry<Item, Integer>> tierItems = new ArrayList<>();
 			for (Map.Entry<Item, Integer> e : have.entrySet()) {
@@ -419,7 +422,7 @@ public final class Smelts {
 		return total;
 	}
 
-	/** Pick the cheapest tier the player already has any of and frame the gap in that item. */
+	/** Pick the highest-preference tier the player already has any of and frame the gap in that item. */
 	private static MissingItem suggestFuelForGap(FuelValues fv, Map<Item, Integer> have, int gapTicks) {
 		if (gapTicks <= 0) gapTicks = 200;  // floor at one smelt's worth
 		for (Predicate<ResourceLocation> tier : FUEL_TIERS) {
