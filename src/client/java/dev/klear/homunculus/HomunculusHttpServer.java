@@ -1,0 +1,80 @@
+package dev.klear.homunculus;
+
+import com.sun.net.httpserver.HttpServer;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public final class HomunculusHttpServer {
+	private static final AtomicInteger THREAD_ID = new AtomicInteger(0);
+	private static final byte[] NOT_FOUND_BODY =
+			"{\"error\":\"not found\"}".getBytes(StandardCharsets.UTF_8);
+
+	private final int port;
+	private HttpServer server;
+	private ExecutorService executor;
+
+	public HomunculusHttpServer(int port) {
+		this.port = port;
+	}
+
+	public void start() throws IOException {
+		if (server != null) return;
+		server = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 4);
+		executor = Executors.newFixedThreadPool(2, r -> {
+			Thread t = new Thread(r, "homunculus-http-" + THREAD_ID.incrementAndGet());
+			t.setDaemon(true);
+			return t;
+		});
+		server.setExecutor(executor);
+		server.createContext("/inventory", new InventoryHandler());
+		server.createContext("/position", new PositionHandler());
+		server.createContext("/scan_column", new ScanColumnHandler());
+		server.createContext("/craft", new CraftHandler());
+		server.createContext("/place", new PlaceHandler());
+		server.createContext("/equip", new EquipHandler());
+		server.createContext("/smelt", new SmeltHandler());
+		server.createContext("/deaths", new DeathsHandler());
+		// /baritone/mine: BOM construction is prewarmed off the render thread to dodge the
+		// BlockOptionalMeta.drops() deadlock (see MineHandler.runMine). If this turns out to
+		// still hang, drop /baritone/mine from the route table and revert to xdotool #mine.
+		if (Baritone.isApiLoaded()) {
+			server.createContext("/baritone/mine", new MineHandler());
+			server.createContext("/baritone/goto", new GotoHandler());
+			server.createContext("/baritone/stop", new StopHandler());
+		} else {
+			BaritoneStubHandler stub = new BaritoneStubHandler();
+			server.createContext("/baritone/mine", stub);
+			server.createContext("/baritone/goto", stub);
+			server.createContext("/baritone/stop", stub);
+			HomunculusClient.LOGGER.warn("Baritone API not on classpath — /baritone/* will return baritone_not_loaded");
+		}
+		server.createContext("/", exchange -> {
+			try {
+				exchange.getResponseHeaders().add("content-type", "application/json");
+				exchange.sendResponseHeaders(404, NOT_FOUND_BODY.length);
+				exchange.getResponseBody().write(NOT_FOUND_BODY);
+			} finally {
+				exchange.close();
+			}
+		});
+		server.start();
+		HomunculusClient.LOGGER.info("HTTP server listening on 127.0.0.1:{}", port);
+	}
+
+	public void stop() {
+		if (server != null) {
+			server.stop(1);
+			server = null;
+		}
+		if (executor != null) {
+			executor.shutdownNow();
+			executor = null;
+		}
+		HomunculusClient.LOGGER.info("HTTP server stopped");
+	}
+}

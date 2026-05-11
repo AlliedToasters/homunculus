@@ -1,0 +1,23 @@
+{
+	"schemaVersion": 1,
+	"id": "homunculus",
+	"version": "${version}",
+	"name": "Homunculus",
+	"description": "Local HTTP API exposing inventory and crafting for the craft Minecraft agent.",
+	"authors": [
+		"Michael Klear"
+	],
+	"license": "MIT",
+	"environment": "client",
+	"entrypoints": {
+		"client": [
+			"dev.klear.homunculus.HomunculusClient"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.19.2",
+		"minecraft": "~1.21.4",
+		"java": ">=21",
+		"fabric-api": "*"
+	}
+}

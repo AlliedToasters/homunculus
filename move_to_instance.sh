@@ -1,0 +1,1 @@
+cp /home/toast/projects/mech_interp/homunculus/build/libs/homunculus-0.1.0.jar /home/toast/.local/share/PrismLauncher/instances/1.21.4/minecraft/mods

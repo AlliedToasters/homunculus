@@ -1,0 +1,575 @@
+# homunculus v1 API spec
+
+Companion to `CLAUDE.md`. Specifies the wire-level API contract for v1. Implementation choices (which mojmap class, which packet) are the implementer's call as long as the contract holds.
+
+## Architecture: separation of concerns
+
+- **homunculus owns atomic operations and recipe ground truth.** Each endpoint either succeeds or fails with rich, structured error data. The mod knows what a recipe requires (via vanilla `RecipeManager`); it does not know what the agent is ultimately trying to build.
+- **`craft` (the Python agent) owns sequential planning.** When a craft fails, the agent reads the structured error and decides what to do next: mine more wood, craft sub-ingredients, place a table, retry. The mod never sequences — the agent does.
+
+This split lets the agent recursively descend any recipe DAG without needing recipe memory in its prompt context. The mod is the source of truth; the agent is the reactive planner.
+
+## Endpoints
+
+### `GET /inventory` *(implemented)*
+
+Returns current player inventory. Sparse — only occupied slots returned. Schema locked:
+
+```json
+{
+  "main": [{"slot": 0, "id": "minecraft:dirt", "count": 1}],
+  "armor": {"feet": null, "legs": null, "chest": null, "head": null},
+  "offhand": null,
+  "selected_slot": 0
+}
+```
+
+Items expose `id` and `count` only — no NBT / components / durability in v1. Damaged tools and enchanted items appear identical to pristine versions. Known limitation, deferred.
+
+### `GET /position` *(new — world state)*
+
+Returns the player's world-space position and orientation. No body.
+
+**Success response:**
+```json
+{
+  "x": 12.5,
+  "y": 64.0,
+  "z": -7.3,
+  "yaw": 180.0,
+  "pitch": 0.0
+}
+```
+
+All values are doubles. Coordinates are world-absolute (block-fractional, not block-aligned). Yaw/pitch follow Mojang conventions: yaw 0 = facing +Z (south), increases clockwise; pitch 0 = horizontal, +90 = looking straight down.
+
+**Failure response:** standard `{success: false, reason, message}` with `reason: "internal_error"`. Only fires if there is no player (title screen, mid-respawn).
+
+### `GET /scan_column` *(new — world state)*
+
+For a given (x, z) column, returns the surface-y — the y a player would stand at to be on top of the column with open sky above. Used by the agent's `surface` recovery primitive (escape from a cave or self-dug pit) and by any other "where's daylight" decision.
+
+**Query params (both optional):**
+- `x` (integer) — block-aligned column x. Default: `floor(player.x)`.
+- `z` (integer) — block-aligned column z. Default: `floor(player.z)`.
+
+**Semantics.** `surface_y` is the topmost y the player can stand at with unbroken air above. Equivalent to vanilla `Heightmap.Types.WORLD_SURFACE.getFirstAvailable(x, z)` for the queried column. (The heightmap is precomputed per-chunk; this is a cheap lookup, not a real scan.)
+
+**Success response:**
+```json
+{
+  "column": [12, -7],
+  "surface_y": 64
+}
+```
+
+`surface_y` may be `null` when the column has no open-sky point (e.g., overhangs all the way to build limit — very rare). Agent treats this as a `surface`-tool failure.
+
+**Failure response:** standard `{success: false, reason, message}`. `reason` is one of:
+- `out_of_range` — requested (x, z) is outside loaded chunks. The default-column request never fires this; only an explicit `x, z` far from the player can.
+- `internal_error` — anything unexpected.
+
+### `GET /deaths` *(planned — world state)*
+
+Returns a buffer of recent player deaths. The agent polls this after each tool call so it can detect a death (which silently wipes inventory and teleports the player), surface the cause into the LLM's context, and optionally route back to the corpse via `/baritone/goto`.
+
+**Why this is in the mod.** A death is the one game-state transition the agent can't infer from `/inventory` + `/position` alone. Position teleports and inventory drops are both also caused by legitimate actions (Baritone goto, dropping items intentionally), so a craft-side heuristic gets false positives. Vanilla MC already knows the cause (it prints `Player fell from a high place` etc. to chat at the moment of death); homunculus surfaces it as structured data.
+
+**Query params:**
+- `since` (optional, integer epoch ms) — return only deaths with `timestamp > since`. Without it, returns the full buffer.
+
+**Success response:**
+```json
+{
+  "deaths": [
+    {
+      "timestamp": 1715492142000,
+      "message": "MichaelKlear fell from a high place",
+      "cause": "fall",
+      "death_pos": [12, 8, -34],
+      "respawn_pos": [-12, 64, 100]
+    }
+  ]
+}
+```
+
+Fields:
+- `timestamp` — epoch ms at the moment of the death event.
+- `message` — vanilla MC death line verbatim. Source: `player.getLastDamageSource().getLocalizedDeathMessage(player).getString()` (same path vanilla uses to render the death screen). Falls back to `player.getCombatTracker().getDeathMessage().getString()` if `getLastDamageSource()` is null.
+- `cause` — bucket derived from `DamageSource.getMsgId()` plus `DamageSource.getEntity()`. If the attacker is a `Player`, returns `player:<name>` (gameProfile name). If the attacker is any other entity, returns `mob:<entity_id>` (e.g. `mob:minecraft:zombie`, via `BuiltInRegistries.ENTITY_TYPE.getKey(...)`). Otherwise mapped from msgId: `fall` (`fall`), `lava` (`lava`), `fire` (`inFire`/`onFire`/`hotFloor`), `drown` (`drown`), `void` (`outOfWorld`), `starvation` (`starve`), `cactus` (`cactus`), `freeze` (`freeze`), `suffocation` (`inWall`/`cramming`), `explosion` (`explosion`/`explosion.player`), `other` (anything not covered).
+- `death_pos` — integer block coords from `player.blockPosition()` at the moment of death, snapshotted before respawn moves the player.
+- `respawn_pos` — integer block coords where the player respawned. May be `null` if the player is still on the dead-screen when `/deaths` is called (see below).
+
+**Failure response:** standard `{success: false, reason, message}` with `reason: "internal_error"`. The endpoint always returns 200 with an empty `deaths` list when no deaths have occurred — empty is not a failure.
+
+**Mod behavior:**
+
+Homunculus is a client-only mod connecting to remote servers (often Purpur), so server-side Fabric events (`ServerLivingEntityEvents.AFTER_DEATH`, `ServerPlayerEvents.AFTER_RESPAWN`) don't fire in this JVM. Death detection is tick-driven on the client — see `DeathTracker`.
+
+1. On mod init, allocate an in-memory ring buffer (capacity 10) for death records. No disk persistence — the agent reads within seconds and a session restart implies a fresh state.
+
+2. **Death detection — `ClientTickEvents.END_CLIENT_TICK` edge-detect.** Each tick, compare current `player.isAlive()` against the previous tick's value. On a `true → false` transition for the same player instance:
+   - Snapshot `timestamp = System.currentTimeMillis()`, `death_pos = player.blockPosition()`.
+   - Read `player.getLastDamageSource()` and derive `message` + `cause` per the field rules above.
+   - Stash in a single "pending" slot (the client controls only one player).
+
+3. **Respawn detection.** On a `false → true` transition with a pending record present, snapshot `player.blockPosition()` as `respawn_pos`, finalize the pending record, and push it into the ring buffer.
+
+4. **Player-instance changes.** When `client.player` becomes a different LocalPlayer instance (dimension change, reconnect, respawn-to-new-entity), reset the `wasAlive` edge tracker against the new player but keep `pending` — if a death happened just before the swap, the next `isAlive()` tick on the new entity finalizes it. When `client.player` goes null (disconnect / world unload), drop any unfinalized pending.
+
+5. **Unfinalized records.** If the player sits on the dead-screen and `/deaths` is queried before respawn, return the pending record with `respawn_pos: null`. After respawn, the same record is finalized in place (the agent's `since`-based polling will see the finalized version on the next poll). Don't block the endpoint waiting for respawn — the dead-screen is user-driven and can be indefinite.
+
+6. `since` filtering: return only records with `timestamp > since`. Records are ordered oldest → newest in the response array; the unfinalized pending (if any) is appended last.
+
+**Threading.** Tick handler runs on the client thread; record construction happens there. The HTTP worker reads the ring buffer under a short `synchronized` block on the `DeathTracker` singleton — no game-thread hop needed for reads.
+
+**Why not a mixin on `ClientboundPlayerCombatKillPacket`?** That's the more authoritative signal (it's exactly when the server announces the death) and is what Baritone uses. Tick-polling has a 1-tick worst-case latency vs the packet hook, but avoids adding mixin infrastructure (none currently in the project) and reads from the same damage-source data the vanilla death screen renders from. If a future need surfaces (e.g. recording deaths that don't flip `isAlive()` on the client for some reason), revisit and mixin.
+
+### `POST /craft`
+
+Request body:
+```json
+{"item": "minecraft:wooden_pickaxe", "count": 1}
+```
+
+`count` semantics: **the exact number of output items to produce in inventory.** The mod batches recipe invocations internally if needed. So `{"item": "minecraft:planks", "count": 16}` runs the planks recipe four times (each yielding 4). `count: 1` is the common case for tools.
+
+Mod behavior:
+1. Look up the recipe from `RecipeManager`.
+2. Compute required ingredients for `count` outputs and check inventory.
+3. If recipe is 3×3, check that a placed `crafting_table` is within reach (~4 blocks of the player).
+4. If both checks pass, execute the craft (or batch of crafts) and return success.
+5. If anything fails, return a structured failure (below).
+
+**Success response:**
+```json
+{
+  "success": true,
+  "crafted": {"id": "minecraft:wooden_pickaxe", "count": 1}
+}
+```
+
+**Failure response:**
+```json
+{
+  "success": false,
+  "reason": "missing_ingredients",
+  "missing": [
+    {"id": "minecraft:planks", "count": 3},
+    {"id": "minecraft:stick", "count": 2}
+  ],
+  "requires_crafting_table": true,
+  "crafting_table_nearby": false,
+  "message": "wooden_pickaxe needs 3 more planks and 2 more sticks; no crafting table within reach"
+}
+```
+
+`reason` is one of:
+- `missing_ingredients` — inventory doesn't have enough. Populate `missing` with the gap.
+- `requires_crafting_table` — recipe is 3×3 and no table is within reach. (Use this only when ingredients are present but the table is missing; if both are missing, prefer `missing_ingredients` and let `requires_crafting_table: true, crafting_table_nearby: false` carry the workbench info.)
+- `no_recipe` — the item has no known recipe (raw materials, mob drops). Agent must acquire it some other way.
+- `unknown_item` — the `item` id doesn't resolve. Likely a typo from the agent.
+- `internal_error` — anything unexpected (packet failure, screen handler issue). Put exception details in `message`.
+
+Notes:
+- **Always include `requires_crafting_table` and `crafting_table_nearby`** regardless of failure reason — both are cheap to compute and the agent reads them for planning.
+- `missing` is the full ingredient gap for `count` outputs, not partial. Agent uses this to reactively craft sub-ingredients in one round.
+
+### `POST /place` *(revised 2026-05-10: auto-positioning)*
+
+The mod picks a placement spot near the player and places the block there. Replaces v1's crosshair-based behavior — the LLM agent is effectively blind to look direction and defaults to staring at the horizon, so positional reasoning is moved into the mod.
+
+Request body:
+```json
+{"item": "minecraft:crafting_table"}
+```
+
+**Mod behavior:**
+1. Verify the item is in inventory; else `not_in_inventory`.
+2. Confirm the item is a placeable block; else `not_placeable`.
+3. **Anti-casing precondition:** count how many of the 8 ring-1 tiles around the player's feet (Chebyshev distance 1) are "open" — air or a replaceable block (tall_grass, snow_layer, fern, etc.). If fewer than 6 are open, return `no_space`. Placing in a tight pocket walls the agent in; refusing is better than succeeding into a trap.
+4. Search candidate placement positions, **preferring ring 2 (distance 2) over ring 1**. A block 2 tiles away gives breathing room; a block adjacent to the player creates a cramped placement. Scan order within each ring: cardinals (N→E→S→W) first, then ring-2 edge tiles flanking each cardinal, then ring-2 corners; ring-1 cardinals; ring-1 diagonals. For each candidate, accept if **(a)** the target cell is open AND **(b)** the block directly below is a sturdy-top solid (vanilla `BlockState.isFaceSturdy(level, pos, Direction.UP)`; full `canSurvive` is not needed because v1 only places crafting_table / furnace / chest-class blocks).
+5. Auto-select the item in the hotbar.
+6. Place at the chosen position. Briefly rotate the player's yaw/pitch toward the support block's top-face center, send a `ServerboundMovePlayerPacket.Rot` so the server's eye-cone check passes, then `useItemOn` with a synthetic `BlockHitResult` against the support's top face. Restore yaw/pitch after.
+
+**Success response:**
+```json
+{
+  "success": true,
+  "placed_at": [12, 64, -7]
+}
+```
+
+**Failure response:**
+```json
+{
+  "success": false,
+  "reason": "no_space",
+  "message": "need more space around player; only 3/8 adjacent tiles clear (need 6+) — relocate to open ground"
+}
+```
+
+`reason` is one of:
+- `no_space` — anti-casing tripped: fewer than 6 of the 8 ring-1 tiles around the player are open. The dominant failure when the agent is in a 1-block hole, against a wall, or in dense foliage. Message reports the actual open-tile count. **Agent action:** relocate (`#goto`, `#thisway`, a few manual steps via Baritone) and retry.
+- `no_placeable_spot` — anti-casing passed (≥6 open) but no candidate had sturdy support below. Rare; occurs when the player is on a 1×1 pillar, on a slab edge, on a floating platform with air around, or wading in water. **Agent action:** relocate and retry.
+- `not_in_inventory` — item not in inventory.
+- `not_placeable` — item isn't a block (e.g. a stick), or the id doesn't resolve.
+- `internal_error` — anything unexpected.
+
+**Why this changed.** v1 raycast-from-crosshair assumed the caller positioned the view before calling. That works under xdotool with a human supervising; it breaks under an LLM planner that has no usable view of where it's facing. The 2026-05-10 rollout confirmed the failure mode: agent arrives at the craft step, can't place the table because it's staring at the horizon, has no path to recover. Moving placement decisions into the mod removes a whole class of agent-side blockers.
+
+**Non-goals (v1):**
+- No multi-block macro placement.
+- No automatic relocation — agent decides where to go on `no_space` / `no_placeable_spot`.
+- No directional preference (e.g., "place in front of me"). The agent only cares that *some* sensible spot was used.
+- No vertical search. Candidates are only scanned at feet-y. Standing on a 1-block step won't see the lower tier; agent retries from a different position.
+
+### `POST /equip`
+
+No body. Auto-equips the "best" item in the player's inventory into a fixed hotbar layout, plus full armor:
+
+| Hotbar slot (0-indexed) | Role            |
+|-------------------------|-----------------|
+| 0                       | sword           |
+| 1                       | axe             |
+| 2                       | pickaxe         |
+| 3                       | shovel          |
+| 4                       | hoe             |
+| 5                       | food            |
+| 6                       | building blocks |
+| 7, 8                    | untouched (caller-managed misc) |
+
+Plus armor slots: head, chest, legs, feet.
+
+**Ranking rules:**
+- **Tools / armor:** material tier inferred from item id prefix (`netherite_` > `diamond_` > `iron_` / `turtle_` > `chainmail_` / `stone_` > `golden_` > `wooden_` / `leather_`). Tiebreak by lower `DAMAGE` (more uses left = better). Mod items with unrecognized prefixes rank below all vanilla tiers.
+- **Food:** highest `FoodProperties.nutrition()`, tiebreak by saturation. Any item with the `FOOD` data component is eligible.
+- **Building blocks:** lowest tier wins (cheapest first), then largest stack count. Curated list, in tier order:
+  - **0 (cheapest):** dirt, coarse_dirt, rooted_dirt, grass_block, podzol, mycelium, mud, packed_mud, cobblestone, cobbled_deepslate, netherrack, blackstone
+  - **1:** stone, deepslate, granite, diorite, andesite, tuff, basalt, smooth_basalt, end_stone, sandstone, red_sandstone, calcite, dripstone_block
+  - **2:** all_planks, all_logs (incl. stripped variants)
+  - **3:** stone_bricks, mossy_cobblestone, mossy_stone_bricks, polished_*, smooth_*, deepslate_bricks, bricks, nether_bricks, red_nether_bricks, chiseled_*
+  - **4:** iron_block, copper_block, raw_iron_block, raw_copper_block, amethyst_block
+  - **5 (last resort):** gold_block, diamond_block, emerald_block, netherite_block, raw_gold_block, lapis_block
+  - Items not in the list are **not** considered for the building slot.
+
+**Behavior:**
+- For each role, finds the best candidate anywhere in inventory (main + hotbar). If best is already in the role slot, no-op. Otherwise swaps via `ClickType.SWAP` (hotbar) or three-pickup cursor cycle (armor).
+- Hotbar 7 and 8 are not auto-managed, but they may receive **displaced** items if a role-matching item happened to be parked there (SWAP semantics: target's old contents go to source slot).
+- Refuses if the player has a non-inventory screen open (chest, crafting table, etc.).
+
+**Success response:**
+```json
+{
+  "success": true,
+  "equipped": {
+    "sword": "minecraft:iron_sword",
+    "axe": null,
+    "pickaxe": "minecraft:stone_pickaxe",
+    "shovel": null,
+    "hoe": null,
+    "food": "minecraft:bread",
+    "building": "minecraft:cobblestone",
+    "head": "minecraft:iron_helmet",
+    "chest": null,
+    "legs": null,
+    "feet": "minecraft:leather_boots"
+  },
+  "changes": [
+    {"role": "sword",    "from": null,                       "to": "minecraft:iron_sword"},
+    {"role": "building", "from": "minecraft:diamond_block",  "to": "minecraft:cobblestone"}
+  ],
+  "message": "2 change(s): sword=iron_sword, building=cobblestone"
+}
+```
+
+`equipped` reports what each slot **currently** holds (post-equip). For role slots (sword/axe/.../building), `null` means the slot does not contain a role-matching item — either nothing, or something else the agent stashed there. Armor slot fields report whatever stack is in that armor slot, or `null` if empty.
+
+**Failure response:** standard `{success:false, reason, message}`. `reason` is one of `internal_error` (no player, screen open, packet failure).
+
+### `POST /smelt` *(planned, not yet implemented)*
+
+Run a furnace smelt for `count` outputs of an item, using fuel from inventory. Mirrors `/craft`'s shape: structured, atomic, sync.
+
+Request body:
+```json
+{"input": "minecraft:raw_iron", "count": 3, "fuel": "minecraft:coal"}
+```
+
+Fields:
+- `input` (required) — the item to smelt (the *consumable*, not the result). E.g., `raw_iron` produces `iron_ingot`; `cobblestone` produces `stone`; `sand` produces `glass`.
+- `count` (required) — number of output items to produce. Mod runs the smelt that many times.
+- `fuel` (optional) — explicit fuel id. If omitted, the mod auto-picks the cheapest sufficient fuel from inventory (see ranking below).
+
+`count` semantics: **the exact number of output items to land in inventory**, parallel to `/craft`. The mod computes fuel needed (`ceil(count / burns_per_fuel_item)`) and validates inventory.
+
+Mod behavior:
+1. Find a placed `furnace` within reach (~4 blocks of the player) — same proximity rule as the crafting_table check in `/craft`.
+2. Look up the smelting recipe from `RecipeManager` for `input`.
+3. Validate input count, fuel availability, and that `count` ≥ 1. Compute fuel budget.
+4. If ingredients/fuel/furnace all check out, open the furnace UI on the game thread, load input + fuel, wait for completion, retrieve output, close UI.
+5. On any failure, return a structured error and make no inventory changes (atomic).
+
+**Success response:**
+```json
+{
+  "success": true,
+  "smelted": {"id": "minecraft:iron_ingot", "count": 3},
+  "fuel_consumed": [{"id": "minecraft:coal", "count": 1}]
+}
+```
+
+`fuel_consumed` is **always a list**, even when only one fuel type was used. When the auto-fuel selector combines multiple types to cover the burn budget (see below), each consumed type appears as its own entry, ordered cheap → expensive.
+
+**Failure response:**
+```json
+{
+  "success": false,
+  "reason": "missing_fuel",
+  "missing": [{"id": "minecraft:coal", "count": 1}],
+  "requires_furnace": true,
+  "furnace_nearby": false,
+  "message": "raw_iron×3 needs 1 coal but inventory has none; no furnace within reach"
+}
+```
+
+`reason` is one of:
+- `missing_input` — not enough of `input` in inventory. Populate `missing` with the shortfall.
+- `missing_fuel` — no usable fuel (or specified fuel insufficient). Populate `missing` with the fuel id + count needed.
+- `requires_furnace` — no placed furnace within reach. (Use this only when input + fuel are both present; if multiple things are missing, prefer `missing_input` / `missing_fuel` and let `furnace_nearby: false` carry the workbench info.)
+- `no_recipe` — `input` has no smelting recipe.
+- `unknown_item` — `input` (or specified `fuel`) doesn't resolve.
+- `internal_error` — anything unexpected.
+
+**Always include `requires_furnace` and `furnace_nearby` regardless of failure reason** — same convention as `/craft`'s table fields.
+
+**Auto-fuel ranking (when `fuel` is omitted).** The selector **accumulates fuel across types** until the burn budget is covered, walking cheap → expensive:
+- Tier order: `stick`, `*_sapling`, `*_planks`, `*_log` / `*_stem`, `charcoal`, `coal`, `coal_block`, `lava_bucket`.
+- Within a tier, larger stacks are taken first (ties broken by item id for determinism).
+- If the furnace already has a valid pre-loaded fuel, that fuel is used first to avoid pointless eviction.
+- The selector only advances to the next tier when the current tier's available pieces don't close the remaining burn-tick deficit. So an agent holding `1×charcoal + 2×planks + 2×logs` (≈14 smelts' worth combined) can run a 10-smelt request without needing any single type to cover the budget alone.
+- Burn-time table (vanilla, ticks): stick=100 (0.5 smelts), sapling=100 (0.5), planks=300 (1.5), log/stem=300 (1.5), charcoal=1600 (8), coal=1600 (8), coal_block=16000 (80), lava_bucket=20000 (100).
+- When the selector still can't cover the budget, the `missing_fuel` response names the cheapest fuel the player already has (or `oak_planks` if they have none) at the count needed to close the gap. The `missing` array reflects the **actual shortfall**, not an arbitrary fuel suggestion.
+- The agent can always force a specific fuel by passing `fuel` explicitly; that path is single-type and will fail with `missing_fuel` if a single stack can't cover the budget.
+
+**Timing note.** Smelting takes ~10s per output (200 ticks). Synchronous request blocks for `~10s × count + setup overhead`. Caller HTTP timeout must accommodate — recommend `max(30, count * 12)` seconds. Mod should still cap internally (e.g., 5min) to avoid hung connections.
+
+**Atomicity caveat.** True atomicity is best-effort: if the mod crashes mid-batch, the furnace may retain partially-smelted state. On clean failures (validation or "furnace got broken / interrupted"), the mod should not leave items stranded — withdraw any pending input and report the failure. Document anything that can leave partial state.
+
+### `POST /baritone/mine`
+
+**Status.** Wired and validated 2026-05-11 after fixing a `BlockOptionalMeta`-construction deadlock — see "Off-thread BOM prewarm" below.
+
+Drive Baritone's `mine` process for one block type and wait for completion. Replaces the `craft/mine.py` chat-scraping loop that lives on top of xdotool + `tail -F` today. The mod drives Baritone through its Java API (`IMineProcess.mine(int, BlockOptionalMeta...)`) and watches `mineProcess.isActive()` plus an inventory delta-check for the terminal signal — no chat parsing.
+
+Request body:
+```json
+{"block": "minecraft:oak_log", "count": 4, "timeout_seconds": 45}
+```
+
+Fields:
+- `block` (required) — namespaced block id (Baritone's `#mine` takes the path-less name, but the mod accepts either form and normalizes; `oak_log` and `minecraft:oak_log` both work).
+- `count` (required) — **cumulative inventory target**, matching Baritone's own `IMineProcess.mine(count, ...)` semantics: Baritone deactivates the mine process the instant inventory reaches N of the matching drop, so this is a target, not a delta. Callers wanting delta semantics must compute `before + delta` themselves (this is what `craft/` does today).
+- `timeout_seconds` (optional, default 45) — total wall-clock budget. Internally split into a short *start* window (default 15s) waiting for Baritone to commit, and the remainder for the actual mine to complete. Mod hard-caps at 300s to avoid hung connections.
+
+**Mod behavior:**
+1. Resolve `block` to a registered `Block` via `BuiltInRegistries.BLOCK.getValue(...)`. If absent, `unknown_block`.
+2. Verify Baritone's API is reachable on the classpath (`baritone.api.BaritoneAPI`); else `baritone_not_loaded`.
+3. Acquire the global Baritone session lock (one outstanding `/baritone/*` op at a time). If already held, return `busy`.
+4. **Off the render thread** (HTTP worker), construct a `BlockOptionalMeta` for the block. This populates the BOM's class-level drop cache without blocking the render thread — see "Off-thread BOM prewarm" below.
+5. Inventory pre-check: count slots where `bom.matches(stack)` and compare to `count`. If already satisfied, short-circuit to `already_satisfied`.
+6. On the game thread, register a scoped `IGameEventListener` (tick + path events) and call `getMineProcess().mine(count, bom)` with the prebuilt BOM.
+7. State-machine loop on the HTTP worker, waiting for a terminal signal (see "Baritone API integration" below).
+8. On `isActive()` going false after going true, run an inventory post-check: if `count` is satisfied, `have_target`; else `interrupted`.
+9. Release lock, return outcome.
+
+**Success response:**
+```json
+{
+  "success": true,
+  "reason": "have_target",
+  "block": "minecraft:oak_log",
+  "target": 4,
+  "message": "mine process completed; target count reached"
+}
+```
+
+**Failure response:**
+```json
+{
+  "success": false,
+  "reason": "unreachable",
+  "block": "minecraft:oak_log",
+  "target": 4,
+  "message": "Baritone bailed: PathEvent.CALC_FAILED"
+}
+```
+
+`reason` is one of:
+- `have_target` — `mineProcess.isActive()` flipped false **and** inventory post-check confirms `count` is met. (Success.)
+- `already_satisfied` — inventory pre-check found `count` was already satisfied before calling `mine()`; Baritone was not invoked. Success, no-op. Lets callers distinguish "no work needed" from "work was done."
+- `unreachable` — Baritone fired `PathEvent.CALC_FAILED`. **Caller action:** try a different candidate, relocate, or give up.
+- `never_started` — start-window (default 15s) elapsed without `mineProcess.isActive()` going true. Usually means Baritone refused the call (no primary instance, mid-other-task, or the block is unmineable). Distinct from `already_satisfied`.
+- `interrupted` — `mineProcess.isActive()` flipped false post-start but inventory post-check shows `count` not met. Typically a concurrent `/baritone/stop`, or Baritone exhausting candidates. The response message includes the actual count so the caller can decide whether partial progress is acceptable.
+- `timeout` — full-budget deadline elapsed while still active. Inventory may have changed; caller should re-read `/inventory`.
+- `busy` — another `/baritone/*` call is in flight.
+- `baritone_not_loaded` — Baritone classes / API not on the runtime classpath. Hard configuration error; not transient.
+- `unknown_block` — `block` id doesn't resolve to a registered block.
+- `internal_error` — anything unexpected.
+
+`PathEvent.CANCELED` is **ignored** during the mine loop. Baritone fires it for routine mid-mine path transitions (path A finishes, planner cancels and replans for the next tree); only `mineProcess.isActive()` is authoritative for completion. External `/baritone/stop` is detected via the inventory post-check (`interrupted`).
+
+**Note on cancellation.** On `unreachable`, `never_started`, `interrupted`, or `timeout`, the mod **always** calls `pathingBehavior.cancelEverything()` before releasing the lock. `cancelEverything()` is synchronous on the game thread; callers can assume that on non-success return, Baritone is idle.
+
+**Off-thread BOM prewarm.** `BlockOptionalMeta`'s constructor calls `getStackHashes() → drops()`, which on a multiplayer client deadlocks the render thread: `drops()` is `static synchronized` and invokes `ServerLevelStub.holder() → method_30349 → CompletableFuture.join` on a registry future that requires the render thread itself to make progress. Constructing the BOM from the HTTP worker thread sidesteps this — the render thread stays free to drive the future. Once `drops()` populates its class-level cache for a given block, subsequent constructions of the same block are cheap and safe on any thread. We then pass the prebuilt BOM into `mineProcess.mine(int, BlockOptionalMeta...)`, avoiding the `mine(int, Block...)` overload which would reconstruct a BOM internally on the render thread. Validated 2026-05-11: 3-log cumulative mine completed in 3.6s end-to-end with no MC freeze.
+
+### `POST /baritone/goto` *(planned — retires xdotool path)*
+
+Drive Baritone's `customGoalProcess` to a world-space coordinate and wait for arrival. Replaces direct chat-injection of `#goto x y z` in `craft/tools.py` (used by `surface`, `descend`, `travel`, and `_goto_home`).
+
+Request body:
+```json
+{"x": 12, "y": 64, "z": -7, "timeout_seconds": 60, "arrival_tolerance": 2}
+```
+
+Fields:
+- `x`, `y`, `z` (required) — integer block coords. Floats are rejected (`#goto` accepts floats but the agent's planners always work in block units; we lock this down to prevent fingerprinting bugs).
+- `timeout_seconds` (optional, default 60). Capped at 300.
+- `arrival_tolerance` (optional, default 2) — Manhattan distance below which the mod treats the move as complete. Matches `craft/tools.py:_wait_for_arrival` (`<=2` of target_y is "arrived").
+
+**Mod behavior:**
+1. Baritone-loaded + lock checks as `/baritone/mine`.
+2. On the game thread, call `getCustomGoalProcess().setGoalAndPath(new GoalBlock(x, y, z))`.
+3. Poll player position on the game thread (250ms cadence) and subscribe an `IGameEventListener` in parallel. Terminate on whichever fires first:
+   - position within `arrival_tolerance` of target — `arrived`
+   - `PathEvent.AT_GOAL` — `arrived` (belt-and-suspenders; both signals normally coincide)
+   - `!customGoalProcess.isActive() && !pathingBehavior.isPathing()` and position not within tolerance — `stuck`
+   - `PathEvent.CALC_FAILED` — `unreachable`
+   - timeout — `timeout`
+4. Always `pathingBehavior.cancelEverything()` before releasing lock (same convention as `/baritone/mine`).
+
+**Success response:**
+```json
+{
+  "success": true,
+  "reason": "arrived",
+  "target": [12, 64, -7],
+  "final_position": [12.5, 64.0, -7.3],
+  "message": "arrived at target within tolerance 2"
+}
+```
+
+**Failure response:**
+```json
+{
+  "success": false,
+  "reason": "stuck",
+  "target": [12, 64, -7],
+  "final_position": [11.5, 65.0, -3.2],
+  "message": "Baritone idled with 4.2 blocks remaining"
+}
+```
+
+`reason` is one of:
+- `arrived` — within tolerance or Baritone confirmed reached goal. (Success.)
+- `stuck` — Baritone stopped pathing but we didn't arrive. Matches the existing PARTIAL semantics in `craft/tools.py`. Caller decides whether to retry, try a different approach, or give up.
+- `unreachable` — Baritone fired `PathEvent.CALC_FAILED`.
+- `canceled` — Baritone fired `PathEvent.CANCELED`, typically because of a concurrent `/baritone/stop`. Distinct from `timeout`: the move was interrupted, not abandoned.
+- `timeout` — full budget elapsed without arrival or definitive idle.
+- `busy`, `baritone_not_loaded`, `internal_error` — same as `/baritone/mine`.
+
+`final_position` is always populated when the mod can read player position (i.e., always except `internal_error` / no-player edge cases). Callers can use it to compute residual distance without a separate `/position` round-trip.
+
+### `POST /baritone/stop`
+
+Cancel any in-flight Baritone task by calling `pathingBehavior.cancelEverything()`.
+
+No body.
+
+**Mod behavior:**
+1. On the game thread, sample `pathingBehavior.isPathing() || customGoalProcess.isActive()` into `wasActive`. Then call `pathingBehavior.cancelEverything()` (synchronous; tears down all Baritone-driven processes). Return `wasActive` as `acked`. **Do not** use `cancelEverything()`'s return value — it returns `true` even when Baritone was already idle.
+
+**Success response:**
+```json
+{
+  "success": true,
+  "acked": true,
+  "message": "Baritone canceled (was running)"
+}
+```
+
+`acked` is `true` if Baritone was running (`pathingBehavior.isPathing()` or `customGoalProcess.isActive()`) at the moment we sampled, `false` if it was already idle. We sample state *before* calling `cancelEverything()` because that call returns `true` even when nothing was running (empirically verified — its boolean does not mean "anything was canceled"). Either way `success: true`; the caller's invariant ("Baritone is not running after this returns") holds.
+
+**Failure response:** standard `{success: false, reason, message}` with `reason: "baritone_not_loaded"` or `internal_error`. No `busy` failure — `/baritone/stop` bypasses the session lock so it can interrupt an in-flight `/baritone/mine` or `/baritone/goto`. When that happens, Baritone fires `PathEvent.CANCELED` to active listeners; `/baritone/goto` folds that into its `canceled` reason, and `/baritone/mine` ignores the event and detects the stop via its inventory post-check (`interrupted` reason).
+
+### Baritone API integration (shared)
+
+All three endpoints drive Baritone through its public Java API rather than parsing chat. The relevant surface:
+
+| Operation                                  | API call                                                                                          |
+|--------------------------------------------|---------------------------------------------------------------------------------------------------|
+| entrypoint                                 | `BaritoneAPI.getProvider().getPrimaryBaritone()` → `IBaritone`                                    |
+| start mining                               | `IBaritone.getMineProcess().mine(int count, BlockOptionalMeta... boms)` — with **prebuilt** BOMs from the off-thread prewarm (see mine endpoint) |
+| start goto                                 | `IBaritone.getCustomGoalProcess().setGoalAndPath(new GoalBlock(x, y, z))`                         |
+| query "is process running"                 | `IBaritoneProcess.isActive()` on the relevant process (`mineProcess`, `customGoalProcess`)        |
+| pathing state                              | `IBaritone.getPathingBehavior().isPathing()`                                                      |
+| path-calc events / failures                | `IGameEventListener.onPathEvent(PathEvent)` — `CALC_FAILED` (terminal for both endpoints), `AT_GOAL` (terminal for goto), `CANCELED` (terminal for goto, ignored by mine) |
+| register the listener                      | `IBaritone.getGameEventHandler()` → `IEventBus.registerEventListener(IGameEventListener)`; extend `AbstractGameEventListener` for default no-op overrides |
+| cancel everything                          | `pathingBehavior.cancelEverything()` — return value is **not reliable** (returns `true` even when idle). Sample `isPathing()`/`isActive()` ourselves for the `acked` field. |
+
+**Build setup.** Add `baritone-api` as a `modCompileOnly` dependency in `build.gradle` — homunculus compiles against the API jar but does not bundle Baritone. At runtime, Baritone is provided by the user's mod loader (same posture as Wurst today). If `baritone.api.BaritoneAPI` isn't reachable at startup, all `/baritone/*` endpoints return `baritone_not_loaded`; the rest of the mod is unaffected.
+
+**Why not chat parsing.** An earlier draft of this spec scraped `[Baritone]` chat lines (`Have N valid items`, `Path goes for X blocks`, `cost coefficient is greater than three`, `reached goal`, `ok canceled`) for terminal signals. That was a lift-and-shift of `craft/mine.py`'s regex set and carried the same brittleness: format-change breakage across Baritone versions, formatting-component edge cases, dual `Path goes for` lines requiring first-only logic. Using the API gives ground-truth process state and removes string parsing from the mod entirely.
+
+**Threading.** All Baritone API calls happen on the game thread via `MinecraftClient.execute(...)` per `CLAUDE.md`. `IGameEventListener` callbacks also fire on the game thread; the per-call wait machinery publishes plain enum/outcome values across threads to the HTTP handlers blocking in `.get()`. **Exception**: `BlockOptionalMeta` construction is deliberately performed on the HTTP worker thread (off the render thread) to avoid the `drops()` deadlock — see "Off-thread BOM prewarm" in the mine endpoint section.
+
+**Cross-cutting locks.** A single `ReentrantLock` ("Baritone session lock") covers `/baritone/mine` and `/baritone/goto`. `/baritone/stop` deliberately does not take it. Lock acquisition is `tryLock` with zero wait; failure → `busy`. There is no queueing.
+
+## Prerequisite: server-side recipe grant
+
+**Assumption.** All vanilla recipes are already present in `ClientRecipeBook` by the time `/craft` is called. Homunculus does **not** force-unlock — it relies on the host server to grant every recipe at player-join via the normal vanilla sync (`ClientboundRecipeBookAddPacket`).
+
+**Why this is server-side.** `ClientRecipeBook` is populated only with recipes the player has "unlocked." On a fresh world without intervention, that's near-empty: picking up `oak_log` unlocks only `oak_planks`, picking up planks unlocks plank-using recipes, etc. Forcing the full graph from the client side is infeasible in MP — `ClientboundRecipeBookAddPacket` only sends entries the player has unlocked, and the client doesn't have the full registry to iterate over. Resolving it on the server (e.g., `recipe give @s *` on join, or equivalent) covers SP and MP uniformly and keeps homunculus free of recipe-data responsibilities.
+
+**Status (2026-05-10).** The bot's dev server grants all recipes on new-player join. Homunculus assumes this.
+
+**Implication for failure semantics.** `no_recipe` from `/craft` and `/smelt` means "this item has no recipe in the registry," not "the player hasn't unlocked it." If the server isn't granting recipes, `/craft` will spuriously return `no_recipe`; that's a deployment misconfiguration, not a mod bug.
+
+**Out of scope for v1.** Homunculus does not detect or work around servers that lack recipe grants. Running against an unmodified vanilla server without this configuration is unsupported.
+
+## Behavioral guarantees
+
+- **Synchronous.** Each request blocks until the operation completes or fails. Reasonable timeout (~5s) for safety.
+- **Atomic.** A craft either succeeds fully or makes no inventory changes. No partial states visible to the agent.
+- **Game-thread safe.** All game-state reads/writes go through `MinecraftClient.execute(...)` per `CLAUDE.md`.
+
+## Non-goals (v1)
+
+- No streaming / async / SSE / WebSocket.
+- No `use` endpoint — crafting-table presence is checked inside `/craft`. Tables are environmental, not a thing the agent activates.
+- No NBT/component-aware crafting (dyed armor, repair recipes, enchanting).
+- No multi-step server-side macros. The mod doesn't sequence "mine wood then craft pickaxe." The agent does.
+- No candidate-cycling inside `/baritone/mine`. The mod handles one block id per call; iterating over wood/stone variants stays in `craft/`.
+
+## Reference: how the agent will consume this
+
+For implementer awareness only — you do not edit `craft/`. The agent's loop for a top-level goal like "wooden_pickaxe" looks roughly like:
+
+```
+goal = ("wooden_pickaxe", 1)
+loop:
+  resp = POST /craft {item, count}
+  if resp.success:
+    done
+  if resp.requires_crafting_table and not resp.crafting_table_nearby:
+    push subgoal: ensure crafting_table placed nearby
+    continue
+  for m in resp.missing:
+    if m has a recipe (recurse on /craft):
+      push subgoal: craft m
+    else:
+      push subgoal: acquire m via mining / other tool
+  continue
+```
+
+The structured error fields (`missing`, `requires_crafting_table`, `crafting_table_nearby`) aren't decoration — they're the planner's input. Keep them honest and complete.
