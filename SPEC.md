@@ -43,7 +43,9 @@ Returns the player's world-space position and orientation. No body.
 
 All values are doubles. Coordinates are world-absolute (block-fractional, not block-aligned). Yaw/pitch follow Mojang conventions: yaw 0 = facing +Z (south), increases clockwise; pitch 0 = horizontal, +90 = looking straight down.
 
-**Failure response:** standard `{success: false, reason, message}` with `reason: "internal_error"`. Only fires if there is no player (title screen, mid-respawn).
+**Failure response:** standard `{success: false, reason, message}`. `reason` is one of:
+- `bad_request` — wrong HTTP method (e.g. POST to a GET endpoint). 4xx.
+- `internal_error` — no player (title screen, mid-respawn) or anything unexpected. 5xx.
 
 ### `GET /scan_column` *(new — world state)*
 
@@ -66,8 +68,133 @@ For a given (x, z) column, returns the surface-y — the y a player would stand 
 `surface_y` may be `null` when the column has no open-sky point (e.g., overhangs all the way to build limit — very rare). Agent treats this as a `surface`-tool failure.
 
 **Failure response:** standard `{success: false, reason, message}`. `reason` is one of:
+- `bad_request` — non-integer query param, malformed query, or wrong HTTP method. 4xx.
 - `out_of_range` — requested (x, z) is outside loaded chunks. The default-column request never fires this; only an explicit `x, z` far from the player can.
 - `internal_error` — anything unexpected.
+
+### `GET /scan_entities` *(planned — world state)*
+
+Returns nearby entities matching a type filter, sorted by distance from the player. The agent's hunt / combat tooling uses this to find a target before pathing to it — Wurst's KillAura + Baritone's item pickup handle the rest of the harvest loop, so the only thing missing from the craft side is "where is the nearest cow." This endpoint fills that gap.
+
+Parallel in scope to `/scan_column`: a cheap read of client-side world state, no game-state mutation, no game-thread hop required for the lookup itself (the client's entity list is volatile but readable).
+
+**Query params:**
+- `type` (required, string) — entity type id to match, e.g. `minecraft:cow`, `minecraft:zombie`. Both namespaced (`minecraft:cow`) and unnamespaced (`cow`) forms are accepted; the mod normalizes via `EntityType.byString(...)` / `BuiltInRegistries.ENTITY_TYPE.get(...)`. Multi-type matching is not supported in v1 — the agent makes one call per type.
+- `radius` (optional, integer, default 32) — search radius in blocks (Chebyshev distance from the player). Capped at 64 server-side — Baritone struggles to path much further than that and a larger scan just returns entities the agent can't reach anyway.
+- `limit` (optional, integer, default 5) — maximum number of entities to return. Sorted nearest-first; the rest are dropped.
+
+**Success response:**
+```json
+{
+  "entities": [
+    {
+      "type": "minecraft:cow",
+      "uuid": "f2a4...",
+      "position": [12.5, 64.0, -7.3],
+      "distance": 4.2,
+      "is_baby": false,
+      "health": 10.0
+    }
+  ]
+}
+```
+
+Fields:
+- `type` — resolved entity type id (always namespaced in the response, regardless of how the caller specified it).
+- `uuid` — entity UUID. Useful if the agent wants to track a specific target across calls (e.g., follow one cow until it dies). String form, not bytes.
+- `position` — entity's current world-space coords as floats (block-fractional). Matches `/position`'s coordinate convention.
+- `distance` — Euclidean distance from the player at scan time, in blocks. Pre-computed because the agent uses it for sort verification and "is anything close enough to hunt" thresholding.
+- `is_baby` — true for baby variants (`Mob.isBaby()`). Lets the agent skip babies on hunt-for-food calls (babies drop nothing useful and killing them feels worse than killing adults — speedrunner norm).
+- `health` — current HP. Useful for choosing the weakest nearby target.
+
+Sorted by `distance` ascending. The full list is sliced to `limit` after sorting.
+
+**Failure response:** standard `{success: false, reason, message}`. `reason` is one of:
+- `bad_request` — missing required `type`, non-integer `radius`/`limit`, malformed query, or wrong HTTP method. 4xx.
+- `unknown_entity_type` — the `type` string doesn't resolve to a registered `EntityType`. Likely a typo or a modded entity not present in the client's registry.
+- `out_of_range` — invalid radius (negative, or >64 after server-side clamping was disabled — currently the server clamps silently so this is unused; reserved for future strict mode).
+- `internal_error` — anything unexpected.
+
+The endpoint always returns 200 with an empty `entities` list when no entities of the requested type are in radius — empty is not a failure. The craft-side `hunt` tool reads emptiness as "no target reachable, try traveling first."
+
+**Mod behavior:**
+
+1. Resolve `type` via `BuiltInRegistries.ENTITY_TYPE.get(ResourceLocation)` — invalid → `unknown_entity_type`.
+2. Read `client.level` (volatile client-side world). If null (title screen, mid-respawn), `internal_error`.
+3. Build a search bounding box: player position ± `radius` on each axis.
+4. Iterate `client.level.getEntities(null, AABB)` (no exclusion entity), filter to entities whose `getType()` matches the resolved target.
+5. For each matching entity, compute Euclidean distance to the player; build the response record.
+6. Sort by distance ascending, slice to `limit`, serialize.
+
+**Threading.** `client.level.getEntities(...)` reads the client-side entity list. The entity list is mutated on the render thread, so the scan should happen on a `MinecraftClient.execute(...)` hop to avoid mid-iteration mutation. The serialization can then happen back on the HTTP worker. Empirically the scan itself is sub-millisecond — no need to optimize.
+
+**Why no category filter (yet).** v1 keeps the scan single-type because category-level filters (`type=animal`, `type=hostile`) introduce a taxonomy question that homunculus shouldn't own — what counts as "animal" varies between mob-pack mods and the agent's intent. Single-type matches the existing `/baritone/mine` shape and lets the agent compose: `hunt` can iterate `[cow, pig, sheep, chicken]` candidates the same way `mine_any_log` iterates log types.
+
+**Non-goals (v1):**
+- No filtering by health, baby/adult, or hostile status server-side. Agent filters from the response.
+- No "tame this entity" / "breed this entity" follow-up actions. Wurst + Baritone cover hunt + harvest; taming is out of scope for the diamond-goal harness.
+- No persistent entity tracking. Each call is a fresh scan; the agent should not assume a UUID returned in call N+1 refers to the same entity instance from call N if it has gone out of range and back.
+
+### `GET /stats` *(implemented)*
+
+Returns the player's vitals, XP, active effects, and a few movement-state booleans. Cheap pure-read snapshot — no game-thread side effects beyond the read hop.
+
+**Why this exists.** The agent needs to know "am I in trouble" (low HP, drowning, on fire), "am I hungry" (food level, saturation), and "what effects am I under" (poison → seek milk; night vision → can plan deeper). All of these are scattered across `Player`/`LocalPlayer` accessors that the agent can't reach via `/inventory` or `/position`. One unified read is cheaper than N specialized endpoints.
+
+No body. No query params.
+
+**Success response:**
+```json
+{
+  "health": 18.0,
+  "max_health": 20.0,
+  "food": 17,
+  "saturation": 5.0,
+  "armor": 4,
+  "air": 300,
+  "max_air": 300,
+  "experience": {"level": 12, "progress": 0.45, "total": 247},
+  "effects": [
+    {
+      "id": "minecraft:night_vision",
+      "amplifier": 0,
+      "duration_ticks": 4200,
+      "infinite": false,
+      "ambient": false
+    }
+  ],
+  "dimension": "minecraft:overworld",
+  "gamemode": "survival",
+  "on_ground": true,
+  "in_water": false,
+  "in_lava": false,
+  "on_fire": false
+}
+```
+
+Fields:
+- `health` / `max_health` — floats. `max_health` reflects current attribute value (modifiers, absorption-baseline aside).
+- `food` — integer 0–20 (`FoodData.getFoodLevel`).
+- `saturation` — float (`FoodData.getSaturationLevel`). 0 means the next damage tick will start draining food.
+- `armor` — integer 0–20 (total armor points across equipped pieces, post-attribute-modifiers).
+- `air` / `max_air` — integer ticks. Default max is 300; underwater drain is 1 tick per game-tick once `air` hits 0.
+- `experience.level` — integer XP level (the green number).
+- `experience.progress` — float 0..1, fraction of the way to next level.
+- `experience.total` — integer total accumulated XP points (the underlying counter, not always equal to level-derived total).
+- `effects` — list of active mob effects. Each entry: `id` (namespaced effect id; `unknown` if the registry holder is unresolved — extremely rare), `amplifier` (0 = level I, 1 = level II), `duration_ticks` (ticks remaining; ignore when `infinite: true`), `infinite` (true for beacon/long-shelf effects with no fixed duration), `ambient` (true for beacon-source effects; affects particle rendering).
+- `dimension` — namespaced dimension id (`minecraft:overworld`, `minecraft:the_nether`, `minecraft:the_end`, or a modded id).
+- `gamemode` — string (`survival`, `creative`, `adventure`, `spectator`). `null` only if the client gamemode handler is mid-transition (rare; usually means we shouldn't have a player either).
+- `on_ground` / `in_water` / `in_lava` / `on_fire` — booleans. `on_fire` is true for any active fire-damage state (burning blocks, recent lava contact, fire-tick remainder).
+
+**Failure response:** standard `{success: false, reason, message}`. `reason` is one of:
+- `bad_request` — wrong HTTP method. 4xx.
+- `internal_error` — no player (title screen, mid-respawn) or anything unexpected. 5xx.
+
+**Non-goals (v1):**
+- No equipped-item / durability data — `/inventory` already covers slot contents; durability is deferred.
+- No absorption hearts as a separate field — bundled into the implicit max-health vs current-health gap. If this gets in the way, we'll split it later.
+- No raw attribute map (movement speed, knockback resistance, etc.). Agent doesn't need it for the diamond-goal harness.
+- No client-side latency ping. If the agent needs that, add a dedicated endpoint.
 
 ### `GET /deaths` *(planned — world state)*
 
@@ -100,7 +227,11 @@ Fields:
 - `death_pos` — integer block coords from `player.blockPosition()` at the moment of death, snapshotted before respawn moves the player.
 - `respawn_pos` — integer block coords where the player respawned. May be `null` if the player is still on the dead-screen when `/deaths` is called (see below).
 
-**Failure response:** standard `{success: false, reason, message}` with `reason: "internal_error"`. The endpoint always returns 200 with an empty `deaths` list when no deaths have occurred — empty is not a failure.
+**Failure response:** standard `{success: false, reason, message}`. `reason` is one of:
+- `bad_request` — non-integer `since`, or wrong HTTP method. 4xx.
+- `internal_error` — anything unexpected. 5xx.
+
+The endpoint always returns 200 with an empty `deaths` list when no deaths have occurred — empty is not a failure.
 
 **Mod behavior:**
 

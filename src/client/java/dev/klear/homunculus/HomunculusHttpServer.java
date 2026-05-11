@@ -34,6 +34,8 @@ public final class HomunculusHttpServer {
 		server.createContext("/inventory", new InventoryHandler());
 		server.createContext("/position", new PositionHandler());
 		server.createContext("/scan_column", new ScanColumnHandler());
+		server.createContext("/scan_entities", new ScanEntitiesHandler());
+		server.createContext("/stats", new StatsHandler());
 		server.createContext("/craft", new CraftHandler());
 		server.createContext("/place", new PlaceHandler());
 		server.createContext("/equip", new EquipHandler());

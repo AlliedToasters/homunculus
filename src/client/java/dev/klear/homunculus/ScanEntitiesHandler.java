@@ -5,22 +5,31 @@ import com.sun.net.httpserver.HttpHandler;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
-import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.phys.AABB;
 
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
-public final class ScanColumnHandler implements HttpHandler {
+public final class ScanEntitiesHandler implements HttpHandler {
 	private static final long SNAPSHOT_TIMEOUT_MS = 2000;
+	private static final int DEFAULT_RADIUS = 32;
+	private static final int MAX_RADIUS = 64;
+	private static final int DEFAULT_LIMIT = 5;
 
 	@Override
 	public void handle(HttpExchange exchange) throws IOException {
@@ -38,18 +47,28 @@ public final class ScanColumnHandler implements HttpHandler {
 				return;
 			}
 
-			final Integer reqX, reqZ;
+			String typeStr = q.get("type");
+			if (typeStr == null || typeStr.isEmpty()) {
+				respond(exchange, 400, failure("bad_request", "type query param is required"));
+				return;
+			}
+
+			final int radius;
+			final int limit;
 			try {
-				reqX = q.containsKey("x") ? Integer.valueOf(q.get("x")) : null;
-				reqZ = q.containsKey("z") ? Integer.valueOf(q.get("z")) : null;
+				int r = q.containsKey("radius") ? Integer.parseInt(q.get("radius")) : DEFAULT_RADIUS;
+				if (r < 0) r = 0;
+				radius = Math.min(r, MAX_RADIUS);
+				int l = q.containsKey("limit") ? Integer.parseInt(q.get("limit")) : DEFAULT_LIMIT;
+				limit = Math.max(0, l);
 			} catch (NumberFormatException e) {
-				respond(exchange, 400, failure("bad_request", "x and z must be integers"));
+				respond(exchange, 400, failure("bad_request", "radius and limit must be integers"));
 				return;
 			}
 
 			Map<String, Object> body;
 			try {
-				body = ClientThread.supply(() -> scan(reqX, reqZ))
+				body = ClientThread.supply(() -> scan(typeStr, radius, limit))
 						.get(SNAPSHOT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
 			} catch (TimeoutException e) {
 				respond(exchange, 504, failure("internal_error", "client thread timeout"));
@@ -59,7 +78,7 @@ public final class ScanColumnHandler implements HttpHandler {
 				respond(exchange, 500, failure("internal_error", "interrupted"));
 				return;
 			} catch (ExecutionException e) {
-				HomunculusClient.LOGGER.error("scan_column failed", e.getCause());
+				HomunculusClient.LOGGER.error("scan_entities failed", e.getCause());
 				respond(exchange, 500, failure("internal_error", "internal error"));
 				return;
 			}
@@ -67,7 +86,7 @@ public final class ScanColumnHandler implements HttpHandler {
 			int status = 200;
 			if (Boolean.FALSE.equals(body.get("success"))) {
 				Object r = body.get("reason");
-				if ("out_of_range".equals(r)) status = 400;
+				if ("unknown_entity_type".equals(r)) status = 400;
 				else status = 503;
 			}
 			respond(exchange, status, body);
@@ -76,8 +95,8 @@ public final class ScanColumnHandler implements HttpHandler {
 		}
 	}
 
-	/** Runs on the client/render thread. */
-	private static Map<String, Object> scan(Integer reqX, Integer reqZ) {
+	/** Runs on the client/render thread — the client entity list is mutated there. */
+	private static Map<String, Object> scan(String typeStr, int radius, int limit) {
 		Minecraft mc = Minecraft.getInstance();
 		LocalPlayer p = mc.player;
 		ClientLevel level = mc.level;
@@ -85,27 +104,48 @@ public final class ScanColumnHandler implements HttpHandler {
 			return failure("internal_error", "no player (not in world)");
 		}
 
-		int x = reqX != null ? reqX : (int) Math.floor(p.getX());
-		int z = reqZ != null ? reqZ : (int) Math.floor(p.getZ());
+		Optional<EntityType<?>> resolved = EntityType.byString(typeStr);
+		if (resolved.isEmpty()) {
+			return failure("unknown_entity_type",
+					"entity type '" + typeStr + "' is not registered");
+		}
+		EntityType<?> target = resolved.get();
+		String resolvedId = BuiltInRegistries.ENTITY_TYPE.getKey(target).toString();
 
-		int chunkX = x >> 4;
-		int chunkZ = z >> 4;
-		if (!level.hasChunk(chunkX, chunkZ)) {
-			return failure("out_of_range",
-					"column (" + x + "," + z + ") is not loaded; move closer and retry");
+		AABB box = new AABB(
+				p.getX() - radius, p.getY() - radius, p.getZ() - radius,
+				p.getX() + radius, p.getY() + radius, p.getZ() + radius);
+
+		List<Entity> matched = level.getEntities(p, box, e -> e.getType() == target);
+
+		List<Map<String, Object>> records = new ArrayList<>(matched.size());
+		for (Entity e : matched) {
+			Map<String, Object> rec = new LinkedHashMap<>();
+			rec.put("type", resolvedId);
+			rec.put("uuid", e.getUUID().toString());
+			List<Object> pos = new ArrayList<>(3);
+			pos.add(e.getX());
+			pos.add(e.getY());
+			pos.add(e.getZ());
+			rec.put("position", pos);
+			rec.put("distance", p.distanceTo(e));
+			if (e instanceof LivingEntity le) {
+				rec.put("is_baby", le.isBaby());
+				rec.put("health", le.getHealth());
+			} else {
+				rec.put("is_baby", false);
+				rec.put("health", null);
+			}
+			records.add(rec);
 		}
 
-		int y = level.getHeight(Heightmap.Types.WORLD_SURFACE, x, z);
-		// Heightmap returns one above the topmost matching block (predicate: !isAir).
-		// Empty-air column → y == getMinY() (no terrain). Overhang to ceiling → y > getMaxY().
-		Object surfaceY = (y <= level.getMinY() || y > level.getMaxY()) ? null : Integer.valueOf(y);
+		records.sort(Comparator.comparingDouble(r -> ((Number) r.get("distance")).doubleValue()));
+		if (records.size() > limit) {
+			records = new ArrayList<>(records.subList(0, limit));
+		}
 
 		Map<String, Object> result = new LinkedHashMap<>();
-		List<Object> col = new ArrayList<>(2);
-		col.add(x);
-		col.add(z);
-		result.put("column", col);
-		result.put("surface_y", surfaceY);
+		result.put("entities", records);
 		return result;
 	}
 

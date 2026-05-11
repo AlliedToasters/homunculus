@@ -16,7 +16,7 @@ public final class DeathsHandler implements HttpHandler {
 	public void handle(HttpExchange exchange) throws IOException {
 		try {
 			if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
-				respond(exchange, 405, failure("internal_error", "method not allowed"));
+				respond(exchange, 405, failure("bad_request", "method not allowed"));
 				return;
 			}
 
@@ -24,7 +24,7 @@ public final class DeathsHandler implements HttpHandler {
 			try {
 				since = parseSince(exchange.getRequestURI());
 			} catch (NumberFormatException e) {
-				respond(exchange, 400, failure("internal_error", "since must be an integer"));
+				respond(exchange, 400, failure("bad_request", "since must be an integer"));
 				return;
 			}
 
