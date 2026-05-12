@@ -3,10 +3,11 @@ package dev.klear.homunculus;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.NonNullList;
 import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.core.Direction;
 import net.minecraft.network.protocol.game.ServerboundPlayerCommandPacket;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.AbstractContainerMenu;
@@ -15,6 +16,7 @@ import net.minecraft.world.inventory.ClickType;
 import net.minecraft.world.inventory.FurnaceMenu;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.entity.FuelValues;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 
@@ -25,19 +27,16 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 /**
- * Executes a smelt against a placed furnace. Right-clicks the furnace to open the server-assigned
- * FurnaceMenu, then:
- *  - peeks all three slots (vanilla furnace BlockEntity items aren't synced to the client; opening
- *    the menu is the only way to see what's already there)
- *  - always evicts pre-existing result-slot contents to inventory so the cook count starts clean
- *  - calls {@link Smelts#evaluate} with the peeked stock, so matching pre-loaded input/fuel counts
- *    toward the budget instead of triggering missing_input/missing_fuel
- *  - evicts mismatched input/fuel (different item from plan) before pushing
- *  - shift-clicks input + fuel from inventory into slots 0/1, only the shortfall after pre-loaded
- *  - polls the result slot until it accumulates the target output, retrieves, closes
+ * Loads a furnace with input + fuel and lights it ({@link #ignite}), or opens a furnace and pulls
+ * the output ({@link #collectFromFurnace}). Both close the menu before returning. Neither blocks
+ * for the cook itself — that runs asynchronously on the server, and the registry/ticker tracks
+ * progress without keeping the menu open.
  *
- * Cleanup in finally: any leftover input/fuel/output gets shift-clicked back to inventory before
- * close, so a partial/aborted smelt doesn't strand items in the furnace.
+ * <p>Single-fuel-type restriction (v1.2). The plan from {@link Smelts#evaluate} may include
+ * multiple fuel components when one tier alone doesn't cover the burn budget. For the async path
+ * we only push the FIRST component and cap the input batch at what that fuel can cook. Any extra
+ * input the agent asked for is left in inventory; the response reports the actual loaded count and
+ * leaves the agent to retry with topped-up fuel.
  */
 public final class Smelter {
 	private Smelter() {}
@@ -47,26 +46,34 @@ public final class Smelter {
 	private static final long FINAL_SETTLE_MS = 150;
 	private static final long MENU_OPEN_TIMEOUT_MS = 1500;
 	private static final long MENU_POLL_INTERVAL_MS = 50;
-	private static final long COOK_POLL_INTERVAL_MS = 250;
-	private static final long COOK_DEADLINE_MIN_MS = 30_000;
-	private static final long COOK_DEADLINE_CAP_MS = 5 * 60_000;
 
-	public sealed interface Result permits Ok, ValidationFailure, ExecutionFailure {}
+	// ── ignite ─────────────────────────────────────────────────────────────
 
-	public record Ok(String resultId, int resultCount, List<FuelUse> fuelUsed) implements Result {}
+	public sealed interface IgniteResult permits IgniteOk, ValidationFailure, ExecutionFailure {}
 
-	/** One fuel type consumed by an Ok smelt — for the response's fuel_consumed array. */
-	public record FuelUse(String id, int count) {}
+	public record IgniteOk(
+			BlockPos furnacePos,
+			ResourceLocation inputItem,
+			int inputLoaded,
+			ResourceLocation resultItem,
+			int outputExpected,
+			List<FurnaceRegistry.FuelLoaded> fuelLoaded,
+			int cookTicksPerBatch,
+			long startedAtMs,
+			int requestedBatches             // what the agent asked for (may be > inputLoaded)
+	) implements IgniteResult {
+		public boolean fuelCapped() { return inputLoaded < requestedBatches; }
+	}
 
-	/** Budget validation failed AFTER opening the menu (with furnace contents factored in). */
-	public record ValidationFailure(Smelts.Failure inner) implements Result {}
+	public record ValidationFailure(Smelts.Failure inner) implements IgniteResult {}
 
-	/** Something glitched mid-execution (open timeout, click loop ran out of attempts, etc.). */
-	public record ExecutionFailure(String message) implements Result {}
+	public record ExecutionFailure(String message) implements IgniteResult {}
 
-	private record SlotPeek(ItemStack input, ItemStack fuel, ItemStack result) {}
-
-	public static Result execute(Smelts.PreOk pre, String requestFuel) throws InterruptedException {
+	/**
+	 * Open the furnace, evict any stale contents, push input + first fuel component, close the menu.
+	 * Returns the loaded plan so the caller can register it. Does NOT wait for cook completion.
+	 */
+	public static IgniteResult ignite(Smelts.PreOk pre, String requestFuel) throws InterruptedException {
 		Minecraft mc = Minecraft.getInstance();
 
 		ExecutionFailure preFail = supply(() -> {
@@ -81,11 +88,10 @@ public final class Smelter {
 		});
 		if (preFail != null) return preFail;
 
-		// If pre-check found no furnace, evaluate will return requires_furnace; no menu work needed.
 		if (!pre.furnaceNearby()) {
+			// Caller should have auto-placed by now; defensive return.
 			Smelts.Result eval = supply(() -> Smelts.evaluate(pre, requestFuel, Smelts.ExtraStock.EMPTY));
 			if (eval instanceof Smelts.Failure f) return new ValidationFailure(f);
-			// Shouldn't reach here without a furnace, but be defensive.
 			return new ExecutionFailure("furnace not nearby but evaluate returned Ok");
 		}
 
@@ -99,7 +105,7 @@ public final class Smelter {
 					+ MENU_OPEN_TIMEOUT_MS + "ms");
 		}
 
-		Result outcome;
+		IgniteResult outcome = null;
 		final boolean[] touched = {false};
 		try {
 			final int cid = containerId;
@@ -117,11 +123,7 @@ public final class Smelter {
 				return outcome;
 			}
 
-			// Build ExtraStock from peeked input/fuel (read-only; nothing changed in furnace yet).
 			Smelts.ExtraStock extra = Smelts.ExtraStock.fromFurnaceSlots(peek.input(), peek.fuel());
-
-			// Run the full budget evaluation BEFORE touching the furnace, so a validation-only failure
-			// (e.g. missing_input even with peek factored in) leaves the user's pre-loaded items alone.
 			Smelts.Result eval = supply(() -> Smelts.evaluate(pre, requestFuel, extra));
 			if (eval instanceof Smelts.Failure f) {
 				outcome = new ValidationFailure(f);
@@ -129,11 +131,33 @@ public final class Smelter {
 			}
 			Smelts.Ok plan = (Smelts.Ok) eval;
 
-			// Past this point we WILL modify furnace state; cleanup-finally is now responsible for
-			// returning anything left over to the player's inventory.
+			// Fuel-cap: only push the first component; cap input batches accordingly.
+			List<Smelts.FuelComponent> components = plan.fuelPlan();
+			if (components.isEmpty()) {
+				outcome = new ExecutionFailure("evaluate returned Ok with empty fuelPlan");
+				return outcome;
+			}
+			Smelts.FuelComponent first = components.get(0);
+			FuelValues fv = mc.level.fuelValues();
+			Item firstFuelItem = BuiltInRegistries.ITEM.getValue(first.id());
+			int firstBurnPerPiece = fv.burnDuration(new ItemStack(firstFuelItem));
+			if (firstBurnPerPiece <= 0) {
+				outcome = new ExecutionFailure("fuel '" + first.id() + "' has zero burn duration");
+				return outcome;
+			}
+			long firstTotalBurnTicks = (long) first.pieces() * firstBurnPerPiece;
+			int firstCanCook = (int) Math.min(Integer.MAX_VALUE, firstTotalBurnTicks / plan.cookTicks());
+			int finalBatches = Math.min(plan.batches(), firstCanCook);
+			if (finalBatches <= 0) {
+				outcome = new ExecutionFailure(
+						"fuel-capped to 0 smelts; first fuel component covers no full smelt");
+				return outcome;
+			}
+			int finalOutputCount = finalBatches * plan.outputPerBatch();
+
 			touched[0] = true;
 
-			// Always evict pre-existing result so cook count starts at 0 and got = afterOutput - beforeOutput is clean.
+			// Evict pre-existing result so the cook starts with a clean output slot.
 			if (!peek.result().isEmpty()) {
 				supply(() -> {
 					LocalPlayer p = mc.player;
@@ -146,15 +170,9 @@ public final class Smelter {
 				Thread.sleep(CLICK_SETTLE_MS);
 			}
 
-			Item resultItem = BuiltInRegistries.ITEM.getValue(pre.resultItem());
-			int beforeOutput = supply(() -> countItem(mc.player, resultItem));
-
 			Item inputItem = BuiltInRegistries.ITEM.getValue(plan.inputItem());
-			Item firstFuelItem = plan.fuelPlan().isEmpty()
-					? null
-					: BuiltInRegistries.ITEM.getValue(plan.fuelPlan().get(0).id());
 
-			// Evict mismatched input — shift-click on a furnace slot routes contents to inventory.
+			// Evict mismatched input.
 			if (!peek.input().isEmpty() && peek.input().getItem() != inputItem) {
 				supply(() -> {
 					LocalPlayer p = mc.player;
@@ -166,7 +184,7 @@ public final class Smelter {
 				});
 				Thread.sleep(CLICK_SETTLE_MS);
 			}
-			// Evict mismatched fuel — only if the pre-loaded fuel doesn't match the first component.
+			// Evict mismatched fuel.
 			if (!peek.fuel().isEmpty() && peek.fuel().getItem() != firstFuelItem) {
 				supply(() -> {
 					LocalPlayer p = mc.player;
@@ -179,7 +197,9 @@ public final class Smelter {
 				Thread.sleep(CLICK_SETTLE_MS);
 			}
 
-			int inputToPush = plan.inputToPush();
+			// Push only the batches we can actually cook. Pre-existing matching input counts toward this.
+			int alreadyInFurnaceInput = (peek.input().getItem() == inputItem) ? peek.input().getCount() : 0;
+			int inputToPush = Math.max(0, finalBatches - alreadyInFurnaceInput);
 			if (inputToPush > 0) {
 				ExecutionFailure pushInput = pushIntoSlot(mc, cid, inputItem,
 						AbstractFurnaceMenu.INGREDIENT_SLOT, inputToPush);
@@ -187,63 +207,42 @@ public final class Smelter {
 				Thread.sleep(CLICK_SETTLE_MS);
 			}
 
-			// Push the first fuel component immediately. Subsequent components are pushed inside
-			// the cook poll loop, each time the fuel slot becomes empty.
-			List<Smelts.FuelComponent> components = plan.fuelPlan();
-			if (!components.isEmpty() && components.get(0).toPush() > 0) {
-				Item fuel0 = BuiltInRegistries.ITEM.getValue(components.get(0).id());
-				ExecutionFailure pf = pushIntoSlot(mc, cid, fuel0,
-						AbstractFurnaceMenu.FUEL_SLOT, components.get(0).toPush());
+			// Push the first fuel component.
+			if (first.toPush() > 0) {
+				ExecutionFailure pf = pushIntoSlot(mc, cid, firstFuelItem,
+						AbstractFurnaceMenu.FUEL_SLOT, first.toPush());
 				if (pf != null) { outcome = pf; return outcome; }
 				Thread.sleep(CLICK_SETTLE_MS);
 			}
 
-			long deadline = computeCookDeadline(plan);
-			int cooked = pollUntilCookedMulti(mc, cid, plan.totalOutput(), components, deadline);
-			if (cooked < 0) {
-				outcome = new ExecutionFailure("furnace menu closed unexpectedly mid-cook");
-				return outcome;
-			}
-			if (cooked < plan.totalOutput()) {
-				outcome = new ExecutionFailure("cook timed out: expected " + plan.totalOutput() + " "
-						+ plan.resultItem() + " in result slot, got " + cooked);
-				return outcome;
-			}
-
-			supply(() -> {
-				LocalPlayer p = mc.player;
-				if (p != null && p.containerMenu.containerId == cid) {
-					ItemStack r = p.containerMenu.getSlot(AbstractFurnaceMenu.RESULT_SLOT).getItem();
-					if (!r.isEmpty()) {
-						mc.gameMode.handleInventoryMouseClick(cid,
-								AbstractFurnaceMenu.RESULT_SLOT, 0, ClickType.QUICK_MOVE, p);
-					}
-				}
-				return null;
-			});
 			Thread.sleep(FINAL_SETTLE_MS);
 
-			int afterOutput = supply(() -> countItem(mc.player, resultItem));
-			int got = afterOutput - beforeOutput;
-			if (got >= plan.totalOutput()) {
-				List<FuelUse> fuelUsed = new ArrayList<>(components.size());
-				for (Smelts.FuelComponent c : components) {
-					fuelUsed.add(new FuelUse(c.id().toString(), c.pieces()));
-				}
-				outcome = new Ok(plan.resultItem().toString(), plan.totalOutput(), fuelUsed);
-			} else {
-				outcome = new ExecutionFailure("expected " + plan.totalOutput() + " " + plan.resultItem()
-						+ " in inventory after smelt, got " + got);
-			}
+			long startedAtMs = System.currentTimeMillis();
+			FurnaceRegistry.FuelLoaded fuelEntry = new FurnaceRegistry.FuelLoaded(
+					first.id(), first.pieces(), firstBurnPerPiece);
+
+			outcome = new IgniteOk(
+					pre.furnacePos(),
+					plan.inputItem(),
+					finalBatches,
+					plan.resultItem(),
+					finalOutputCount,
+					List.of(fuelEntry),
+					plan.cookTicks(),
+					startedAtMs,
+					plan.batches());
 			return outcome;
 		} finally {
+			final boolean wasTouched = touched[0];
+			final IgniteResult finalOutcome = outcome;
 			supply(() -> {
 				LocalPlayer p = mc.player;
 				if (p != null && p.containerMenu != p.inventoryMenu
 						&& p.containerMenu.containerId == containerId) {
-					// Only evict if we modified the furnace. On validation-only failure we leave
-					// pre-loaded items where the user put them.
-					if (touched[0]) {
+					// On validation-only failure, leave the user's pre-loaded items where they were.
+					// We never evict on ignite-success — we WANT the input/fuel left in the furnace
+					// so the cook can proceed after we close the menu.
+					if (wasTouched && !(finalOutcome instanceof IgniteOk)) {
 						int cid = p.containerMenu.containerId;
 						for (int slot : new int[]{AbstractFurnaceMenu.RESULT_SLOT,
 								AbstractFurnaceMenu.INGREDIENT_SLOT,
@@ -261,22 +260,113 @@ public final class Smelter {
 		}
 	}
 
-	private static long computeCookDeadline(Smelts.Ok plan) {
-		long expected = (long) plan.batches() * plan.cookTicks() * 50L;
-		long withSafety = (long) (expected * 1.5) + 5_000L;
-		long capped = Math.min(withSafety, COOK_DEADLINE_CAP_MS);
-		long minimum = COOK_DEADLINE_MIN_MS;
-		return System.currentTimeMillis() + Math.max(minimum, capped);
-	}
+	// ── collect ────────────────────────────────────────────────────────────
+
+	public sealed interface CollectResult permits CollectOk, CollectFailure {}
+
+	public record CollectOk(
+			ResourceLocation collectedItem,
+			int collectedCount,
+			int inputRemaining,
+			int fuelRemainingBurns
+	) implements CollectResult {}
+
+	public record CollectFailure(String reason, String message) implements CollectResult {}
 
 	/**
-	 * Shift-clicks {@code needed} pieces of {@code item} from the player-inventory portion of the
-	 * open container into {@code targetSlot}. Tracks inventory drain rather than the target slot's
-	 * count: when pushing fuel, the furnace can consume already-deposited pieces during the
-	 * settle-between-clicks delay, which would falsely look like underfill if measured at the
-	 * target. Drain-tracking counts a piece as "transferred" the moment it leaves inventory,
-	 * regardless of whether it's still in the slot or already burning.
+	 * Open the furnace at {@code pos}, pull whatever's in the result slot into inventory, peek
+	 * input + fuel for the registry, close. Caller is expected to be within reach already.
 	 */
+	public static CollectResult collectFromFurnace(BlockPos pos) throws InterruptedException {
+		Minecraft mc = Minecraft.getInstance();
+
+		CollectFailure preFail = supply(() -> {
+			LocalPlayer p = mc.player;
+			if (p == null) return new CollectFailure("internal_error", "no player (not in world)");
+			if (mc.gameMode == null) return new CollectFailure("internal_error", "no gameMode");
+			if (mc.level == null) return new CollectFailure("internal_error", "no level");
+			if (p.containerMenu != p.inventoryMenu) {
+				return new CollectFailure("internal_error",
+						"another inventory screen is open; close it before collecting");
+			}
+			return null;
+		});
+		if (preFail != null) return preFail;
+
+		ExecutionFailure openFail = supply(() -> openFurnace(mc, pos));
+		if (openFail != null) return new CollectFailure("internal_error", openFail.message);
+
+		int containerId = waitForFurnaceMenu(mc, MENU_OPEN_TIMEOUT_MS);
+		if (containerId < 0) {
+			supply(() -> { closeContainerSafely(mc); return null; });
+			return new CollectFailure("internal_error",
+					"furnace at " + pos + " did not open a FurnaceMenu within " + MENU_OPEN_TIMEOUT_MS + "ms");
+		}
+
+		try {
+			final int cid = containerId;
+			SlotPeek peek = supply(() -> {
+				LocalPlayer p = mc.player;
+				if (p == null || p.containerMenu.containerId != cid) return null;
+				AbstractContainerMenu menu = p.containerMenu;
+				return new SlotPeek(
+						menu.getSlot(AbstractFurnaceMenu.INGREDIENT_SLOT).getItem().copy(),
+						menu.getSlot(AbstractFurnaceMenu.FUEL_SLOT).getItem().copy(),
+						menu.getSlot(AbstractFurnaceMenu.RESULT_SLOT).getItem().copy());
+			});
+			if (peek == null) {
+				return new CollectFailure("internal_error", "furnace menu vanished before peek");
+			}
+
+			ItemStack resultStack = peek.result();
+			ResourceLocation collectedItem = null;
+			int collectedCount = 0;
+			if (!resultStack.isEmpty()) {
+				Item resultItem = resultStack.getItem();
+				collectedItem = BuiltInRegistries.ITEM.getKey(resultItem);
+				int beforeOutput = supply(() -> countItem(mc.player, resultItem));
+				supply(() -> {
+					LocalPlayer p = mc.player;
+					if (p != null && p.containerMenu.containerId == cid) {
+						mc.gameMode.handleInventoryMouseClick(cid,
+								AbstractFurnaceMenu.RESULT_SLOT, 0, ClickType.QUICK_MOVE, p);
+					}
+					return null;
+				});
+				Thread.sleep(FINAL_SETTLE_MS);
+				int afterOutput = supply(() -> countItem(mc.player, resultItem));
+				collectedCount = Math.max(0, afterOutput - beforeOutput);
+			}
+
+			int inputRemaining = peek.input().getCount();
+			ItemStack fuelStack = peek.fuel();
+			int fuelRemainingBurns = 0;
+			if (!fuelStack.isEmpty()) {
+				FuelValues fv = mc.level.fuelValues();
+				int burnPer = fv.burnDuration(fuelStack);
+				if (burnPer > 0) {
+					// Approximate; "burns" here is in cook-batch units (200 ticks each).
+					fuelRemainingBurns = (int) ((long) fuelStack.getCount() * burnPer / 200L);
+				}
+			}
+
+			return new CollectOk(collectedItem, collectedCount, inputRemaining, fuelRemainingBurns);
+		} finally {
+			supply(() -> {
+				LocalPlayer p = mc.player;
+				if (p != null && p.containerMenu != p.inventoryMenu
+						&& p.containerMenu.containerId == containerId) {
+					closeContainerSafely(mc);
+				}
+				return null;
+			});
+		}
+	}
+
+	// ── helpers ────────────────────────────────────────────────────────────
+
+	private record SlotPeek(ItemStack input, ItemStack fuel, ItemStack result) {}
+
 	private static ExecutionFailure pushIntoSlot(Minecraft mc, int containerId, Item item,
 												  int targetSlot, int needed) throws InterruptedException {
 		final int FURNACE_SLOTS = AbstractFurnaceMenu.SLOT_COUNT;
@@ -342,57 +432,6 @@ public final class Smelter {
 		}
 		return total;
 	}
-
-	/**
-	 * Polls the result slot until {@code wanted} pieces have cooked, OR the deadline expires. While
-	 * polling, also pushes the next fuel component each time the fuel slot becomes empty. The first
-	 * component (index 0) is pushed by the caller before entering this loop; index 1+ are pushed
-	 * here.
-	 */
-	private static int pollUntilCookedMulti(Minecraft mc, int containerId, int wanted,
-											 List<Smelts.FuelComponent> components,
-											 long deadlineMs) throws InterruptedException {
-		int nextComponent = components.size() > 1 ? 1 : components.size();  // index of next unpushed
-		while (System.currentTimeMillis() < deadlineMs) {
-			SlotPoll poll = supply(() -> {
-				LocalPlayer p = mc.player;
-				if (p == null) return null;
-				AbstractContainerMenu menu = p.containerMenu;
-				if (menu.containerId != containerId) return null;
-				ItemStack r = menu.getSlot(AbstractFurnaceMenu.RESULT_SLOT).getItem();
-				ItemStack f = menu.getSlot(AbstractFurnaceMenu.FUEL_SLOT).getItem();
-				return new SlotPoll(r.isEmpty() ? 0 : r.getCount(), f.isEmpty());
-			});
-			if (poll == null) return -1;
-			if (poll.cooked() >= wanted) return poll.cooked();
-
-			if (nextComponent < components.size() && poll.fuelEmpty()) {
-				Smelts.FuelComponent comp = components.get(nextComponent);
-				int toPush = comp.toPush();
-				if (toPush > 0) {
-					Item fuelItem = BuiltInRegistries.ITEM.getValue(comp.id());
-					ExecutionFailure pf = pushIntoSlot(mc, containerId, fuelItem,
-							AbstractFurnaceMenu.FUEL_SLOT, toPush);
-					if (pf != null) {
-						// Push failed — exit polling early; caller will report cook-timeout.
-						HomunculusClient.LOGGER.warn("smelt: failed to push fuel component {}: {}",
-								nextComponent, pf.message());
-						return poll.cooked();
-					}
-				}
-				nextComponent++;
-			}
-			Thread.sleep(COOK_POLL_INTERVAL_MS);
-		}
-		return supply(() -> {
-			LocalPlayer p = mc.player;
-			if (p == null || p.containerMenu.containerId != containerId) return 0;
-			ItemStack r = p.containerMenu.getSlot(AbstractFurnaceMenu.RESULT_SLOT).getItem();
-			return r.isEmpty() ? 0 : r.getCount();
-		});
-	}
-
-	private record SlotPoll(int cooked, boolean fuelEmpty) {}
 
 	private static ExecutionFailure openFurnace(Minecraft mc, BlockPos pos) {
 		LocalPlayer p = mc.player;

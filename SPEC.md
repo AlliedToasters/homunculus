@@ -418,9 +418,11 @@ Plus armor slots: head, chest, legs, feet.
 
 **Failure response:** standard `{success:false, reason, message}`. `reason` is one of `internal_error` (no player, screen open, packet failure).
 
-### `POST /smelt` *(implemented)*
+### `POST /smelt` *(v1.1 — superseded by the v1.2 async redesign below)*
 
 Run a furnace smelt for `count` outputs of an item, using fuel from inventory. Mirrors `/craft`'s shape: structured, atomic, sync.
+
+> **Note (2026-05-11).** This v1.1 sync behavior was implemented and shipped, then superseded by the v1.2 fire-and-forget design (next section). The v1.1 spec is kept for historical reference; the running mod no longer implements it. `POST /smelt`, `GET /smelt_status`, and `POST /collect_smelt` all behave per the v1.2 spec.
 
 Request body:
 ```json
@@ -499,7 +501,7 @@ Mod behavior:
 
 ---
 
-### Async smelt redesign *(planned — v1.2)*
+### Async smelt redesign *(implemented — v1.2)*
 
 **Why.** The v1.1 `POST /smelt` blocks for `~10s × count` while the furnace ticks down. That's correct as a single atomic operation but wrong as an *agent loop primitive*: the agent's turn freezes, the player stands idle and exposed, and during 2026-05-11 hostile-mode rollouts this directly caused a "died mid-cook" with full material loss. In MC reality smelting is fire-and-forget — load the furnace and do other things. The agent's tool surface should mirror that.
 

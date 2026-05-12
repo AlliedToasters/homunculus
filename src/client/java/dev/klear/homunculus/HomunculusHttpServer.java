@@ -40,6 +40,8 @@ public final class HomunculusHttpServer {
 		server.createContext("/place", new PlaceHandler());
 		server.createContext("/equip", new EquipHandler());
 		server.createContext("/smelt", new SmeltHandler());
+		server.createContext("/smelt_status", new SmeltStatusHandler());
+		server.createContext("/collect_smelt", new CollectSmeltHandler());
 		server.createContext("/deaths", new DeathsHandler());
 		// /baritone/mine: BOM construction is prewarmed off the render thread to dodge the
 		// BlockOptionalMeta.drops() deadlock (see MineHandler.runMine). If this turns out to

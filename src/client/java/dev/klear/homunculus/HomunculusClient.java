@@ -17,6 +17,7 @@ public final class HomunculusClient implements ClientModInitializer {
 	@Override
 	public void onInitializeClient() {
 		DeathTracker.register();
+		FurnaceTicker.register();
 		ClientLifecycleEvents.CLIENT_STARTED.register(client -> {
 			try {
 				httpServer.start();
