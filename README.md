@@ -32,6 +32,8 @@ Bound to `127.0.0.1:25566` only. No auth; localhost bind is the boundary. All en
 | POST   | `/smelt`     | `{"input": "minecraft:raw_iron", "count": 1}` (optional `"fuel": "minecraft:coal"`) |
 | POST   | `/baritone/mine` | `{"block": "oak_log", "count": 4, "timeout_seconds": 45}` |
 | POST   | `/baritone/goto` | `{"x": 12, "y": 64, "z": -7, "timeout_seconds": 60, "arrival_tolerance": 2}` |
+| POST   | `/baritone/excavate` | `{"x1": 12, "y1": 62, "z1": -7, "x2": 15, "y2": 64, "z2": -4, "timeout_seconds": 120}` |
+| POST   | `/baritone/fill` | `{"block": "cobblestone", "x1": 12, "y1": 62, "z1": -7, "x2": 15, "y2": 62, "z2": -4}` |
 | POST   | `/baritone/stop` | —                                                |
 
 `/position` returns the player's world-space `{x, y, z, yaw, pitch}` as doubles (Mojang conventions: yaw 0 = facing +Z, pitch 0 = horizontal). For perception and goto math.
@@ -46,7 +48,9 @@ Bound to `127.0.0.1:25566` only. No auth; localhost bind is the boundary. All en
 
 `/smelt` runs `count` smelts of `input` against a placed furnace within 4 blocks. Pre-loaded items in the furnace count toward available stock — if the furnace already has the input or fuel from a prior smelt, the mod uses what's there and only pushes the shortfall from inventory. Auto-fuel ranking prefers any pre-loaded valid fuel (so we don't pointlessly evict it); otherwise **combines fuels** across tiers (sticks → saplings → planks → logs → charcoal → coal → coal_block → lava_bucket) until the burn budget is covered. The Smelter feeds each fuel type into the fuel slot in sequence, waiting for the slot to drain between types. Blocks for `~10s × count` plus open/close overhead. `count` is hard-capped at 64 per call (furnace input/output slot limits).
 
-`/baritone/*` requires Baritone installed at runtime (we depend on `baritone-api-fabric-1.13.1`). If absent, all three endpoints return `{success: false, reason: "baritone_not_loaded"}` and the rest of the mod is unaffected. `/baritone/mine` and `/baritone/goto` share a session lock — one in flight at a time, the other returns `reason: "busy"`. `/baritone/stop` bypasses the lock so it can interrupt the active call. The `count` field on `/baritone/mine` is **cumulative inventory target** (Baritone's own semantics), not a delta — and we short-circuit to `reason: "already_satisfied"` if the target is already met before invoking Baritone.
+`/baritone/*` requires Baritone installed at runtime (we depend on `baritone-api-fabric-1.13.1`). If absent, all five endpoints return `{success: false, reason: "baritone_not_loaded"}` and the rest of the mod is unaffected. `/baritone/mine`, `/goto`, `/excavate`, and `/fill` share a session lock — one in flight at a time, the others return `reason: "busy"`. `/baritone/stop` bypasses the lock so it can interrupt the active call. The `count` field on `/baritone/mine` is **cumulative inventory target** (Baritone's own semantics), not a delta — and we short-circuit to `reason: "already_satisfied"` if the target is already met before invoking Baritone.
+
+`/baritone/excavate` and `/baritone/fill` are axis-aligned-box primitives: excavate clears a box (calls `IBuilderProcess.clearArea`), fill places a block at every air cell in a box (calls `build()` with a `FillSchematic`). Both cap at **500 blocks** of volume — shelter-sized. `excavate` preserves player-placed torches (`buildIgnoreBlocks`). `fill` requires the fill block to already be in the player's hotbar (Baritone won't reach into main inventory) — pair with `/equip` first, or the call returns `missing_block`. Composition for a floored shelter: excavate the volume → equip cobblestone → fill the floor slice (`y1==y2`).
 
 A subtle implementation detail worth mentioning: `BlockOptionalMeta` (Baritone's drop-aware block matcher) deadlocks the render thread if constructed from the game thread on a multiplayer client — its constructor synchronously joins on a registry future that needs the render thread to make progress. We dodge this by constructing BOMs on the HTTP worker thread before the `mine()` call. See `SPEC.md`'s "Off-thread BOM prewarm" for the diagnostic and rationale.
 
@@ -86,7 +90,15 @@ curl -s -X POST http://127.0.0.1:25566/baritone/mine -d '{"block":"oak_log","cou
 # Baritone: goto a block coord
 curl -s -X POST http://127.0.0.1:25566/baritone/goto -d '{"x":12,"y":64,"z":-7}' | jq
 
-# Baritone: cancel anything in flight (mine or goto)
+# Baritone: clear a shelter-sized box (max 500 blocks volume)
+curl -s -X POST http://127.0.0.1:25566/baritone/excavate \
+  -d '{"x1":12,"y1":62,"z1":-7,"x2":15,"y2":64,"z2":-4}' | jq
+
+# Baritone: fill a box with a block (block must be in hotbar — /equip first)
+curl -s -X POST http://127.0.0.1:25566/baritone/fill \
+  -d '{"block":"cobblestone","x1":12,"y1":62,"z1":-7,"x2":15,"y2":62,"z2":-4}' | jq
+
+# Baritone: cancel anything in flight (mine / goto / excavate / fill)
 curl -s -X POST http://127.0.0.1:25566/baritone/stop | jq
 ```
 
@@ -178,4 +190,4 @@ Primary loop is manual curl + watching the game. No automated test framework in 
 
 ## Status
 
-v1 functionally complete: `/inventory`, `/position`, `/scan_column`, `/craft` (2×2 and 3×3), `/place`, `/equip`, `/smelt`, `/baritone/mine`, `/baritone/goto`, `/baritone/stop` all working end-to-end on both single-player and multiplayer. SP and MP share one code path — recipes are sourced from `ClientRecipeBook`, the same display-side API the in-game recipe book screen uses (it carries furnace recipes alongside crafting-grid ones). Baritone endpoints depend on the API jar at runtime; if Baritone isn't installed, those three return `baritone_not_loaded` and the rest of the mod is unaffected.
+v1 functionally complete: `/inventory`, `/position`, `/scan_column`, `/craft` (2×2 and 3×3), `/place`, `/equip`, `/smelt`, `/baritone/mine`, `/baritone/goto`, `/baritone/excavate`, `/baritone/fill`, `/baritone/stop` all working end-to-end on both single-player and multiplayer. SP and MP share one code path — recipes are sourced from `ClientRecipeBook`, the same display-side API the in-game recipe book screen uses (it carries furnace recipes alongside crafting-grid ones). Baritone endpoints depend on the API jar at runtime; if Baritone isn't installed, those five return `baritone_not_loaded` and the rest of the mod is unaffected.

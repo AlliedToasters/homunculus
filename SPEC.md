@@ -318,7 +318,7 @@ Request body:
 **Mod behavior:**
 1. Verify the item is in inventory; else `not_in_inventory`.
 2. Confirm the item is a placeable block; else `not_placeable`.
-3. **Anti-casing precondition:** count how many of the 8 ring-1 tiles around the player's feet (Chebyshev distance 1) are "open" — air or a replaceable block (tall_grass, snow_layer, fern, etc.). If fewer than 6 are open, return `no_space`. Placing in a tight pocket walls the agent in; refusing is better than succeeding into a trap.
+3. **Anti-casing precondition:** count how many of the 8 ring-1 tiles around the player's feet (Chebyshev distance 1) are "open" — air or a replaceable block (tall_grass, snow_layer, fern, etc.). If fewer than `RING_1_OPEN_MIN` are open (default `3`), return `no_space`. Placing in a tight pocket walls the agent in; refusing is better than succeeding into a trap. The threshold reads `HOMUNCULUS_RING1_OPEN_MIN` at static init (env var), so it can be raised for tighter rollouts or lowered if testing reveals 3 is still too strict — no rebuild needed, just an MC client restart. Below 3 means more cased than open around the player, which is the actual casing scenario; above 5 rejects most natural surface terrain (grass tufts, minor slopes) so the agent loses turns to relocation. 3 is the threshold where "at least one cardinal-pair of escape routes" is guaranteed.
 4. Search candidate placement positions, **preferring ring 2 (distance 2) over ring 1**. A block 2 tiles away gives breathing room; a block adjacent to the player creates a cramped placement. Scan order within each ring: cardinals (N→E→S→W) first, then ring-2 edge tiles flanking each cardinal, then ring-2 corners; ring-1 cardinals; ring-1 diagonals. For each candidate, accept if **(a)** the target cell is open AND **(b)** the block directly below is a sturdy-top solid (vanilla `BlockState.isFaceSturdy(level, pos, Direction.UP)`; full `canSurvive` is not needed because v1 only places crafting_table / furnace / chest-class blocks).
 5. Auto-select the item in the hotbar.
 6. Place at the chosen position. Briefly rotate the player's yaw/pitch toward the support block's top-face center, send a `ServerboundMovePlayerPacket.Rot` so the server's eye-cone check passes, then `useItemOn` with a synthetic `BlockHitResult` against the support's top face. Restore yaw/pitch after.
@@ -336,13 +336,13 @@ Request body:
 {
   "success": false,
   "reason": "no_space",
-  "message": "need more space around player; only 3/8 adjacent tiles clear (need 6+) — relocate to open ground"
+  "message": "need more space around player; only 2/8 adjacent tiles clear (need 3+) — relocate to open ground"
 }
 ```
 
 `reason` is one of:
-- `no_space` — anti-casing tripped: fewer than 6 of the 8 ring-1 tiles around the player are open. The dominant failure when the agent is in a 1-block hole, against a wall, or in dense foliage. Message reports the actual open-tile count. **Agent action:** relocate (`#goto`, `#thisway`, a few manual steps via Baritone) and retry.
-- `no_placeable_spot` — anti-casing passed (≥6 open) but no candidate had sturdy support below. Rare; occurs when the player is on a 1×1 pillar, on a slab edge, on a floating platform with air around, or wading in water. **Agent action:** relocate and retry.
+- `no_space` — anti-casing tripped: fewer than `RING_1_OPEN_MIN` (default 3) of the 8 ring-1 tiles around the player are open. The dominant failure when the agent is in a 1-block hole, against a wall, or in dense foliage. Message reports the actual open-tile count. **Agent action:** relocate (`#goto`, `#thisway`, a few manual steps via Baritone) and retry.
+- `no_placeable_spot` — anti-casing passed (≥`RING_1_OPEN_MIN` open) but no candidate had sturdy support below. Rare; occurs when the player is on a 1×1 pillar, on a slab edge, on a floating platform with air around, or wading in water. **Agent action:** relocate and retry.
 - `not_in_inventory` — item not in inventory.
 - `not_placeable` — item isn't a block (e.g. a stick), or the id doesn't resolve.
 - `internal_error` — anything unexpected.
@@ -514,7 +514,7 @@ Mod behavior:
 Same request body as v1.1. New behavior:
 
 1. Validate input/fuel availability (same as v1.1: recipe lookup, count cap, fuel budget).
-2. Find a placed furnace within reach (~4 blocks, same proximity rule as v1.1). If none, **auto-place from inventory**: requires `minecraft:furnace` in the player's inventory, then invokes the same `Placer` path as `/place` (ring-2 preference, anti-casing precondition: ≥6 of 8 ring-1 tiles open). Placement failures roll up as `/smelt` failures with the placement reason (`no_space`, `no_placeable_spot`, `not_in_inventory`). The newly-placed furnace becomes the target.
+2. Find a placed furnace within reach (~4 blocks, same proximity rule as v1.1). If none, **auto-place from inventory**: requires `minecraft:furnace` in the player's inventory, then invokes the same `Placer` path as `/place` (ring-2 preference, anti-casing precondition: ≥`RING_1_OPEN_MIN` of 8 ring-1 tiles open — see `/place` for tuning). Placement failures roll up as `/smelt` failures with the placement reason (`no_space`, `no_placeable_spot`, `not_in_inventory`). The newly-placed furnace becomes the target.
 3. Open the furnace UI on the game thread, transfer input + fuel into the appropriate slots, light it.
 4. **Register the smelt** in the in-process furnace registry keyed by furnace `BlockPos`. Record: input id+count, expected output id+count, fuel loaded, `started_at_ms`, expected `eta_seconds`.
 5. Close the UI and return immediately — **do not wait for the cook to finish**.
@@ -538,7 +538,7 @@ Synchronous failure reasons. Note that with auto-placement folded into step 2, `
 - `missing_input` / `missing_fuel` — same as v1.1.
 - `no_recipe` / `unknown_item` — same as v1.1.
 - `not_in_inventory` — no furnace within reach and the player has no `minecraft:furnace` in inventory to auto-place. Agent must craft one.
-- `no_space` — auto-placement tried, anti-casing tripped: fewer than 6 of 8 ring-1 tiles around the player are open. Agent must relocate.
+- `no_space` — auto-placement tried, anti-casing tripped: fewer than `RING_1_OPEN_MIN` (default 3) of 8 ring-1 tiles around the player are open. Agent must relocate.
 - `no_placeable_spot` — auto-placement tried, anti-casing passed, but no candidate cell had sturdy support below. Agent must relocate.
 - `internal_error` — anything else.
 
@@ -794,23 +794,59 @@ Fields:
 
 Drive Baritone's `customGoalProcess` to a world-space coordinate and wait for arrival. Replaces direct chat-injection of `#goto x y z` in `craft/tools.py` (used by `surface`, `descend`, `travel`, and `_goto_home`).
 
-Request body:
+Request body — `goal_type="block"` (default, current behavior):
 ```json
-{"x": 12, "y": 64, "z": -7, "timeout_seconds": 60, "arrival_tolerance": 2}
+{
+  "x": 12, "y": 64, "z": -7,
+  "goal_type": "block",
+  "timeout_seconds": 60,
+  "arrival_tolerance": 2,
+  "allow_place": true,
+  "throwaway_items": ["minecraft:dirt", "minecraft:netherrack"],
+  "ensure_throwaway_in_hotbar": true
+}
+```
+
+Request body — `goal_type="y_level"` (planned v1.4, only `y` required):
+```json
+{
+  "y": 8,
+  "goal_type": "y_level",
+  "timeout_seconds": 90
+}
 ```
 
 Fields:
-- `x`, `y`, `z` (required) — integer block coords. Floats are rejected (`#goto` accepts floats but the agent's planners always work in block units; we lock this down to prevent fingerprinting bugs).
+- `goal_type` *(planned — v1.4, optional, default `"block"`)* — selects the Baritone `Goal` implementation:
+  - `"block"` (default, current behavior) — `GoalBlock(x, y, z)`, a specific point. Requires all of `x`, `y`, `z`. Arrival = position within `arrival_tolerance` of the point.
+  - `"y_level"` — `GoalYLevel(y)`, *any* point at the given y. Requires only `y`; `x` and `z` are ignored if present. Arrival = `PathEvent.AT_GOAL` (Baritone's own `GoalYLevel` arrival semantics); `arrival_tolerance` is ignored. See "Y-level goal" below.
+- `x`, `y`, `z` — integer block coords. Required when `goal_type="block"`. When `goal_type="y_level"`, only `y` is required; `x` / `z` are accepted but unused (keeps the schema uniform for clients that always send all three). Floats are rejected.
 - `timeout_seconds` (optional, default 60). Capped at 300.
-- `arrival_tolerance` (optional, default 2) — Manhattan distance below which the mod treats the move as complete. Matches `craft/tools.py:_wait_for_arrival` (`<=2` of target_y is "arrived").
+- `arrival_tolerance` (optional, default 2) — Manhattan distance below which the mod treats a `"block"` goto as complete (near-miss tolerance — see arrival logic below). **Ignored for `goal_type="y_level"`**: Baritone's `GoalYLevel` defines arrival itself and the mod delegates to `PathEvent.AT_GOAL` rather than a position predicate.
+- `allow_place` *(planned — v1.3, optional, default `true`)* — when `false`, the mod sets Baritone's `allowPlace` setting to `false` for the duration of this call, preventing Baritone from consuming any inventory block for pillar-up / bridging during pathing. Coarsest protection level. See "Inventory-protected goto" below.
+- `throwaway_items` *(planned — v1.3, optional, default `null`)* — list of namespaced item ids restricting Baritone's `acceptableThrowawayItems` setting for the duration of this call. When `null`, Baritone's default list is used (`cobblestone, dirt, netherrack`). When provided as a list, *only* those items may be placed by Baritone — useful for "you can bridge, but only with dirt, not the cobblestone I'm about to craft with." Empty list `[]` is equivalent to `allow_place=false`. The previous setting is restored on lock release.
+- `ensure_throwaway_in_hotbar` *(planned — v1.3, optional, default `false`)* — when `true`, before pathing starts, the mod scans the agent's inventory for a throwaway item (filtered by `throwaway_items` when set, else Baritone's defaults) and swaps it into hotbar slot 6. Selection heuristic: **most-plentiful match wins** (maximizing the chance the goto completes — running out of pathing blocks mid-traversal is a common Baritone failure). On goto completion (success *or* failure), the original slot-6 contents are restored. This is scoped to the goto call: if /equip later re-stages a different building block, that's fine — the next /baritone/goto with this flag will swap again. Symmetry with the `allow_place` snapshot-restore.
 
 **Mod behavior:**
 1. Baritone-loaded + lock checks as `/baritone/mine`.
-2. On the game thread, call `getCustomGoalProcess().setGoalAndPath(new GoalBlock(x, y, z))`.
-3. Poll player position on the game thread (250ms cadence) and subscribe an `IGameEventListener` in parallel. Terminate on whichever fires first:
-   - position within `arrival_tolerance` of target — `arrived`
-   - `PathEvent.AT_GOAL` — `arrived` (belt-and-suspenders; both signals normally coincide)
-   - `!customGoalProcess.isActive() && !pathingBehavior.isPathing()` and position not within tolerance — `stuck`
+1a. **Settings snapshot-and-mutate**, all guarded by a try/finally on lock release:
+    - If `allow_place == false`: snapshot `Baritone.settings().allowPlace.value`, set to `false`.
+    - If `throwaway_items != null`: snapshot `Baritone.settings().acceptableThrowawayItems.value`, replace with the resolved item list (`ResourceLocation.tryParse` → `BuiltInRegistries.ITEM` lookup; unknown items are skipped with a logged warning, not an error). Empty resolved list is allowed (caller asked for nothing, Baritone won't place anything).
+    - If `ensure_throwaway_in_hotbar == true`: scan main inventory + hotbar for items matching the resolved throwaway set (or Baritone's default if `throwaway_items` was not provided). Pick the item with the **highest total count**; ties broken by the order in `throwaway_items` if provided, else alphabetical. Snapshot slot 6's current item (id + count), then swap the selected stack into slot 6. If no matching item is found anywhere in inventory, log a warning and proceed without staging (best-effort). All settings are restored on lock release; slot 6 is restored to its pre-call contents.
+    - Baritone settings are global so the mutate-and-restore is mandatory; the session lock guarantees serial access.
+2. On the game thread, construct the Goal based on `goal_type` and call `getCustomGoalProcess().setGoalAndPath(goal)`:
+   - `"block"` → `new GoalBlock(x, y, z)`
+   - `"y_level"` → `new GoalYLevel(y)`
+3. Poll player position on the game thread (250ms cadence) and subscribe an `IGameEventListener` in parallel. Arrival logic differs by `goal_type`:
+
+   For `"block"` (unchanged from v1.2): terminate on whichever fires first:
+   - position within `arrival_tolerance` Manhattan distance of `(x, y, z)` — `arrived`. Earns its keep here as a near-miss tolerance — Baritone sometimes lands slightly off the requested column, and "close enough" should count.
+   - `PathEvent.AT_GOAL` — `arrived` (belt-and-suspenders; both signals normally coincide).
+
+   For `"y_level"`: terminate only on `PathEvent.AT_GOAL` for arrival. **No position-predicate.** `GoalYLevel(y)` already defines arrival as "player y equals target y" inside Baritone, so `AT_GOAL` is authoritative and the predicate isn't earning its keep. Worse, it would actively misfire mid-route: the player traverses through the y-plane on the way to the goal, so a free-firing predicate would trip the instant the player crossed the target y, with `cancelEverything()` stranding them there. Matches vanilla `#goto Y` semantics — Baritone stops when it's at the right y, full stop.
+
+   Common to both goal types:
+   - `!customGoalProcess.isActive() && !pathingBehavior.isPathing()` and arrival not yet detected — `stuck`
    - `PathEvent.CALC_FAILED` — `unreachable`
    - timeout — `timeout`
 4. Always `pathingBehavior.cancelEverything()` before releasing lock (same convention as `/baritone/mine`).
@@ -843,9 +879,99 @@ Fields:
 - `unreachable` — Baritone fired `PathEvent.CALC_FAILED`.
 - `canceled` — Baritone fired `PathEvent.CANCELED`, typically because of a concurrent `/baritone/stop`. Distinct from `timeout`: the move was interrupted, not abandoned.
 - `timeout` — full budget elapsed without arrival or definitive idle.
+- `invalid_request` — request body fails validation. Examples: `goal_type="block"` without all of `x`/`y`/`z`; `goal_type="y_level"` without `y`; unknown `goal_type` string. Message names the specific field. Validation happens before lock acquisition and before any settings mutation.
 - `busy`, `baritone_not_loaded`, `internal_error` — same as `/baritone/mine`.
 
 `final_position` is always populated when the mod can read player position (i.e., always except `internal_error` / no-player edge cases). Callers can use it to compute residual distance without a separate `/position` round-trip.
+
+`target` shape mirrors `goal_type`:
+- `goal_type="block"` → `"target": [x, y, z]`.
+- `goal_type="y_level"` → `"target": {"y": <int>}`. The object form (rather than `[null, y, null]` or echoing back ignored x/z) makes the goal-type discriminator explicit in the response without requiring callers to also echo `goal_type` in the body they consume.
+
+#### Y-level goal *(planned — v1.4)*
+
+**The failure mode.** `descend(target_y)` and `surface()` express y-plane intent ("get me to y=8 to mine diamond" / "get me to sky level"), but the current implementation in `craft/tools.py` converts them to `GoalBlock(px, target_y, pz)` — a fixed 3D point in the agent's *current* column. Baritone has no permission to deviate around obstacles. So when the agent calls `descend(8)` from y=64 in a column with no natural shaft, Baritone digs straight down through stone block-by-block, ignoring a perfectly traversable cave 3 blocks east.
+
+Observed symptoms:
+- Deep `descend` calls consistently exec for 30-45s while Baritone vertical-mines, instead of leveraging existing cave systems where they exist.
+- The chunking (`DESCEND_MAX_PER_CALL = 40`) becomes a band-aid: each chunked goto picks the current (px, pz) and continues digging in that column even after the previous chunk has shifted x/z.
+- The arrival-tolerance check (Manhattan distance ≤ 2) sometimes fails for legitimate descents because Baritone ended at the right y but slightly off the original x/z column.
+
+**The fix.** Baritone's `GoalYLevel(y)` goal type matches the agent's actual intent: any point at the target y satisfies the goal. Baritone routes through caves and natural shafts when they exist, falls back to mining when they don't, and arrival is "are we at the right y?" not "are we at the exact x/y/z?" — delegated to Baritone via `PathEvent.AT_GOAL` rather than a mod-side position predicate (the predicate would misfire mid-route as the player traverses through the target y-plane).
+
+**API shape.** New optional `goal_type: "block" | "y_level"` on `/baritone/goto`. Default `"block"` preserves current behavior. When `"y_level"`, only `y` is required; the mod constructs `GoalYLevel(y)` and uses `PathEvent.AT_GOAL` as the sole arrival signal (no mod-side position predicate, `arrival_tolerance` ignored). `x` / `z` may be sent (for client-side schema uniformity) but are ignored.
+
+**Caller-side change** (lives in `craft/`, not homunculus):
+- `handle_descend` and `handle_surface` switch their `_baritone_goto` call to `goal_type="y_level"` and drop the `(px, pz)` they currently haul along.
+- `handle_goto_corpse`, `handle_travel`, `_goto_home` stay on `"block"` (they want specific points, not a plane).
+
+**Future goal types deferred.** `GoalNear(x, y, z, radius)`, `GoalGetToBlock(x, y, z)`, etc., could plug into the same `goal_type` switch if a future use case arises. v1.4 ships `"block"` and `"y_level"`; the others stay deferred.
+
+**Stuck/unreachable semantics.** Unchanged. A `"y_level"` goto that can't reach the target y (e.g., bedrock floor for a deep descend) returns `unreachable` or `stuck`, same as today's `"block"` goto.
+
+#### Inventory-protected goto *(planned — v1.3)*
+
+**The failure mode.** Baritone's default `allowPlace=true` lets it consume "throwaway" blocks (cobblestone, dirt, netherrack — Baritone's hardcoded `acceptableThrowawayItems` list) to pillar-up out of self-dug shafts, bridge gaps, and traverse otherwise-impassable terrain. This is the correct default for *explicit* movement (the `travel` tool — the agent said "go this way, I don't care how"), but wrong for *implicit* movement initiated by the harness before a craft or smelt that's about to consume those same items.
+
+Concrete instance observed 2026-05-11 (r3 rollout, T4-T7 doom loop):
+
+1. `mine_stone(10)` → Baritone picks the nearest stone, dug straight DOWN, agent ends in a 1-wide shaft with 10x cobblestone.
+2. `craft(stone_pickaxe)` → `_craft_recursive` triggers `_goto_home()` because the crafting_table is back on the surface.
+3. Baritone pillars back up the shaft, *using the freshly-mined cobblestone* as throwaway placement.
+4. Agent arrives at the table with 0 cobblestone. `/craft` returns `missing_ingredients` (rendered as `no_recipe — must be acquired` by `_craft_recursive`'s fallback path — misleading but downstream of the real issue).
+5. Agent mines more stone → step 1 → infinite loop.
+
+The fix lives in `craft/`, not homunculus: pre-craft, expand the recipe's leaf-level ingredient requirements (we already have `CRAFTING_RECIPES` for this), check overlap with Baritone's throwaway set, and decide whether to pass `allow_place=false` based on inventory headroom. The substrate handles the policy; the agent stays unaware.
+
+**Two compounding gotchas in Baritone's defaults.** Beyond consuming the wrong items, Baritone has a second limitation: **it won't move items from main inventory to hotbar** to acquire a placement block. It will only place items already in hotbar slots. So even if dirt is at inventory slot 13, Baritone can't reach it for pillar-up. This means the protection design has to address both *which* items Baritone is allowed to place AND *which* items are physically available to the placement code path (hotbar-resident). The `/equip` layout reserves slot 6 for building blocks but picks "most plentiful builder" without policy awareness — fine in isolation, wrong when paired with a goto that needs to *preserve* the most-plentiful builder for an upcoming craft.
+
+**Why three parameters instead of one.** The natural protection levels compose, and a single boolean can't express the middle ground:
+
+| Scenario | `allow_place` | `throwaway_items` | `ensure_throwaway_in_hotbar` | Outcome |
+|----------|---------------|-------------------|------------------------------|---------|
+| Default v1.2 behavior | `true` | `null` | `false` | Baritone uses whatever's in hotbar from its defaults. |
+| Strict protection | `false` | `null` | `false` | Baritone won't place anything. Goto may `unreachable` in tight terrain. |
+| **Surgical protection** | `true` | `["minecraft:dirt"]` | `true` | "Bridge with dirt only, and stage one in slot 6 so you actually can." Preserves cobblestone for the upcoming `stone_pickaxe` craft while keeping traversal robust. |
+| Loud-fail strict | `true` | `[]` | `false` | Empty list collapses to no-placement; same loud-fail as `allow_place=false`. |
+
+The third row is the *normal-case* substrate protection. The first/second rows are useful as escape hatches and for compatibility.
+
+**Selection heuristic (most-plentiful match).** When `ensure_throwaway_in_hotbar=true`, the mod picks from inventory by maximum total count. Reasoning: traversal-completion is the goal; running out of pathing blocks mid-traversal causes Baritone to `unreachable` even when goal is technically pathable. Maximizing block count maximizes goto robustness. The alternative ("burn the least valuable item") was rejected because (a) the caller already encoded value by filtering `throwaway_items`, and (b) abundance ≈ disposability in practice for the throwaway set.
+
+**Slot-6 restore on goto exit.** The hotbar swap is scoped to the goto call. Pre-call: snapshot slot 6's current ItemStack (id + count + nbt), swap the selected throwaway in. Post-call (success OR failure): restore the snapshot to slot 6. This means a "build → path → build" cycle works cleanly — the building-block in slot 6 returns after pathing, the agent can keep stacking. The alternative (let the swap persist) would force /equip to re-run after every goto and would surprise callers using the building-block slot for non-pathing purposes.
+
+**Failure-mode change.** Under any non-default configuration, Baritone may return `unreachable` in terrain it would otherwise have bridged. The craft side surfaces this as a normal goto failure and the agent can recover (call `surface()` first to clear the shaft, retry the craft with `location="here"`, etc.). Loud failure is strictly better than the current silent-inventory-consumption mode, which presents as an unrecoverable doom loop.
+
+**Caller-side policy sketch** (lives in `craft/`, not homunculus):
+```python
+THROWAWAY = {"minecraft:cobblestone", "minecraft:dirt", "minecraft:netherrack"}
+
+def _throwaway_policy(recipe_item, recipe_count):
+    """Decide goto protection level for an upcoming craft.
+
+    Returns (allow_place, throwaway_items, ensure_in_hotbar).
+
+    Rule: any recipe ingredient in the throwaway set is *reserved* for the
+    craft, full stop. Baritone is restricted to the remaining throwaway
+    items on this trip; if everything's reserved, placement is disabled
+    entirely.
+    """
+    needs = _recipe_needs(recipe_item, recipe_count)  # recursive expansion
+    protected = needs.keys() & THROWAWAY
+
+    if not protected:
+        return (True, None, False)  # no overlap, defaults
+
+    permitted = sorted(THROWAWAY - protected)
+    if not permitted:
+        return (False, None, False)  # everything reserved → strict, may fail-unreachable
+
+    return (True, permitted, True)  # surgical: restrict to permitted, stage one in hotbar
+```
+
+**Why no inventory check or buffer.** An earlier iteration tried `have < need + buffer` to allow Baritone to use throwaway items when the agent had a surplus. The buffer turned out to be the wrong abstraction: Baritone's per-trip placement consumption is unbounded (observed 25 throwaway blocks consumed on a 49-block ascent during r4 T8), so any constant buffer is exploitable. The substrate-initiated goto is a short recipe-anchored trip — being strict here costs little because the trip is bounded by the recipe context. Long-horizon traversal uses the `travel()` tool which keeps default behavior and consumes the throwaway surplus organically.
+
+Call sites: anywhere the harness calls `_goto_home()` on behalf of an upcoming craft — currently `_craft_recursive` (`requires_crafting_table` fallback), `handle_craft` (upfront `location="home"`), and `handle_smelt` (both `location="home"` and `requires_furnace` fallback, treating the upcoming op as a furnace-craft for protection purposes since the post-goto path may auto-craft a furnace).
 
 ### `POST /baritone/stop`
 
@@ -869,18 +995,166 @@ No body.
 
 **Failure response:** standard `{success: false, reason, message}` with `reason: "baritone_not_loaded"` or `internal_error`. No `busy` failure — `/baritone/stop` bypasses the session lock so it can interrupt an in-flight `/baritone/mine` or `/baritone/goto`. When that happens, Baritone fires `PathEvent.CANCELED` to active listeners; `/baritone/goto` folds that into its `canceled` reason, and `/baritone/mine` ignores the event and detects the stop via its inventory post-check (`interrupted` reason).
 
+### `POST /baritone/excavate` *(implemented)*
+
+Drive Baritone's `IBuilderProcess.clearArea(p1, p2)` to dig out an axis-aligned box and wait for the builder to idle. Replaces the multi-step Reddit recipe for clearing a shelter-sized space (`.b sel 1` / `sel 2` / `sel expand` / `sel cleararea` + three settings tweaks) with one call.
+
+Request body:
+```json
+{
+  "x1": 12, "y1": 62, "z1": -7,
+  "x2": 15, "y2": 64, "z2": -4,
+  "timeout_seconds": 120
+}
+```
+
+Fields:
+- `x1, y1, z1, x2, y2, z2` (required) — opposite corners of the box, inclusive. Floats are rejected. Order doesn't matter (the mod normalizes to min/max internally).
+- `timeout_seconds` (optional, default 120). Capped at 600.
+
+**Volume cap.** The box volume `(x2-x1+1)*(y2-y1+1)*(z2-z1+1)` must be ≤ 500 blocks. This is shelter-sized — for example 8×4×8=256 or 6×5×6=180. Above that, the mod returns `invalid_request` rather than spending a 10-minute timeout on a stadium dig. If the caller genuinely needs a larger excavate, they should split it into adjacent boxes.
+
+**Mod behavior:**
+1. Baritone-loaded + volume + lock checks. If volume exceeds cap → `invalid_request`.
+2. **Off the render thread**, prewarm `new BlockOptionalMeta(Blocks.AIR)`. `clearArea` internally constructs a `FillSchematic(air)` whose BOM would hit the `drops()` deadlock on first on-thread construction (same root cause as `/baritone/mine`). Prewarming populates the BOM drops cache.
+3. **Pre-scan**: count non-air, non-torch blocks in the box. If zero, short-circuit to `already_clear`.
+4. **Settings snapshot-and-mutate**, guarded by try/finally on lock release:
+   - `buildIgnoreBlocks` → `[torch, wall_torch, soul_torch, soul_wall_torch]` (preserve player-placed lighting if re-clearing an existing shelter; harmless for fresh excavates).
+   - `buildInLayers` → `true` (build top-to-bottom or bottom-to-top in strict layers — empirically far less likely to get Baritone stuck mid-dig).
+   - `layerOrder` → `true` (top-down ordering, matches the Reddit recipe).
+5. On the game thread, register an `AbstractGameEventListener` and call `getBuilderProcess().clearArea(new BlockPos(min), new BlockPos(max))`.
+6. Poll on tick events for `builderProcess.isActive()`. Wait for the standard start-window (15s) and then the remaining `timeout_seconds` budget.
+7. When `isActive()` flips false after a prior active state, run a **post-scan** of the box. Zero remaining non-air non-torch blocks → `cleared`. Non-zero → `partial`.
+8. Always restore the three settings + `cancelEverything()` before releasing the lock.
+
+**Success response:**
+```json
+{
+  "success": true,
+  "reason": "cleared",
+  "box": [12, 62, -7, 15, 64, -4],
+  "volume": 48,
+  "remaining": 0,
+  "message": "excavate completed; 48 blocks cleared"
+}
+```
+
+**Failure response:**
+```json
+{
+  "success": false,
+  "reason": "partial",
+  "box": [12, 62, -7, 15, 64, -4],
+  "volume": 48,
+  "remaining": 3,
+  "message": "builder idled with 3 of 48 blocks unbroken"
+}
+```
+
+`reason` is one of:
+- `cleared` — builder went active then inactive; post-scan confirms zero non-air non-torch blocks remain. (Success.)
+- `already_clear` — pre-scan found nothing to break; builder was not invoked. (Success.)
+- `partial` — builder idled but the post-scan shows N blocks still standing. Typically: lava-locked block, mob in the way, or a no-tool-for-this-block situation (no pickaxe and the block is stone). Caller decides whether to retry, equip a better tool, or accept partial.
+- `never_started` — start window (15s) elapsed without `builderProcess.isActive()` going true. Usually means Baritone refused the call (mid-other-task; the lock should have caught that, but belt-and-suspenders).
+- `timeout` — budget elapsed while builder was still active. Response includes the live `remaining` count.
+- `invalid_request` — volume exceeds cap, or coords aren't integers.
+- `busy`, `baritone_not_loaded`, `internal_error` — as `/baritone/mine`.
+
+`PathEvent` is **ignored** during the excavate loop. The builder may emit `CALC_FAILED` for individual unreachable cells while still making progress on others; only `isActive()` flipping false is authoritative.
+
+**Why not surface `ISelectionManager`.** The Reddit recipe drives `ISelectionManager` (`addSelection`, `expand`) to define a region, then `clearArea` mode on the builder process. `IBuilderProcess.clearArea(p1, p2)` is the one-call shortcut — it internally constructs a `FillSchematic` of air covering the box and runs the builder process directly. No selection state to leak across calls; nothing for the mod to clean up if a call is interrupted.
+
+### `POST /baritone/fill` *(implemented)*
+
+Mirror of `/baritone/excavate`: drive `IBuilderProcess.build(name, FillSchematic, origin)` to place a target block at every air cell in an axis-aligned box. Composes with `/baritone/excavate` for "dig out a shelter and seal the floor" — excavate first, then fill the floor slice.
+
+Request body:
+```json
+{
+  "block": "minecraft:cobblestone",
+  "x1": 12, "y1": 62, "z1": -7,
+  "x2": 15, "y2": 62, "z2": -4,
+  "timeout_seconds": 120
+}
+```
+
+Fields:
+- `block` (required) — namespaced block id (`cobblestone` and `minecraft:cobblestone` both work; the mod normalizes).
+- `x1, y1, z1, x2, y2, z2`, `timeout_seconds` — same shape as `/baritone/excavate`. Same 500-block volume cap.
+
+**Pre-flight: fill block must be in hotbar.** Baritone won't reach into main inventory for placement blocks — it only places from hotbar slots 0-8. If the fill block isn't in any hotbar slot when this is called, the mod returns `missing_block` before kicking off the builder. **Caller pairs `/equip` with `/baritone/fill`** to stage the fill block first. (We deliberately do not auto-equip — the agent already has equip policy via `/equip` and adding implicit hotbar mutation here would surprise composed callers.)
+
+**Mod behavior:**
+1. Resolve `block` → registered `Block`. Unknown → `invalid_request`. Block has no item form → `invalid_request`.
+2. Baritone-loaded + volume + lock checks.
+3. **Off the render thread**, prewarm `new BlockOptionalMeta(targetBlock)` and hand it to the `FillSchematic`. Same deadlock prevention as `/baritone/excavate`.
+4. **Hotbar check**: iterate slots 0-8; require ≥1 stack of the fill item. If absent → `missing_block`.
+5. **Pre-scan**: count air cells in the box. If zero, short-circuit to `already_filled`.
+6. **Settings snapshot-and-mutate**, guarded by try/finally:
+   - `buildIgnoreBlocks` → `[]` (no torch exception — fill semantics are "place where there's air," not "preserve special cells").
+   - `buildInLayers` → `true`.
+   - `layerOrder` → `true`.
+   - `buildIgnoreExisting` → `true`. **Important**: this makes the builder skip cells that already contain *any* block, replacing only air. So "fill" is "fill the empties" — non-air mismatched cells (e.g., natural dirt where the caller wants cobble) are left alone. If the caller wants strict-replace semantics, they should `/baritone/excavate` first, then `/baritone/fill`.
+7. On the game thread, build the `FillSchematic(width, height, depth, bom)` and call `getBuilderProcess().build("homunculus-fill", schem, new Vec3i(x_min, y_min, z_min))`.
+8. Poll for `builderProcess.isActive()` flipping false after a prior active state. Post-scan counts remaining air cells. Zero → `filled`. Non-zero → `partial`.
+9. Restore settings + `cancelEverything()` before releasing the lock.
+
+**Success response:**
+```json
+{
+  "success": true,
+  "reason": "filled",
+  "block": "minecraft:cobblestone",
+  "box": [12, 62, -7, 15, 62, -4],
+  "volume": 16,
+  "remaining": 0,
+  "message": "fill completed; 16 cells now non-air"
+}
+```
+
+**Failure response:**
+```json
+{
+  "success": false,
+  "reason": "missing_block",
+  "block": "minecraft:cobblestone",
+  "box": [12, 62, -7, 15, 62, -4],
+  "volume": 16,
+  "remaining": 0,
+  "message": "fill block 'minecraft:cobblestone' not present in hotbar (Baritone can't reach main inventory)"
+}
+```
+
+`reason` is one of:
+- `filled` — post-scan shows zero air cells. (Success.)
+- `already_filled` — pre-scan found no air cells; builder was not invoked. (Success.)
+- `partial` — builder idled with air cells remaining (ran out of fill stack mid-build, or couldn't reach some cells).
+- `missing_block` — fill block not in hotbar at start. Caller should `/equip` and retry.
+- `invalid_request` — unknown block id, block has no placeable item form, volume cap exceeded, or non-integer coords.
+- `never_started`, `timeout`, `busy`, `baritone_not_loaded`, `internal_error` — as `/baritone/excavate`.
+
+**Composition pattern for "floored shelter":**
+```
+POST /baritone/excavate  { x1..z2 of full shelter volume }
+POST /equip              { block: "cobblestone" }
+POST /baritone/fill      { block: "cobblestone", floor slice (y1==y2==shelter_floor_y) }
+```
+The excavate pass clears any natural ground irregularities first; the fill pass then plugs the (now-airy) floor with a solid slab. Walls / ceiling are the same pattern with different slices.
+
 ### Baritone API integration (shared)
 
-All three endpoints drive Baritone through its public Java API rather than parsing chat. The relevant surface:
+All five endpoints drive Baritone through its public Java API rather than parsing chat. The relevant surface:
 
 | Operation                                  | API call                                                                                          |
 |--------------------------------------------|---------------------------------------------------------------------------------------------------|
 | entrypoint                                 | `BaritoneAPI.getProvider().getPrimaryBaritone()` → `IBaritone`                                    |
 | start mining                               | `IBaritone.getMineProcess().mine(int count, BlockOptionalMeta... boms)` — with **prebuilt** BOMs from the off-thread prewarm (see mine endpoint) |
 | start goto                                 | `IBaritone.getCustomGoalProcess().setGoalAndPath(new GoalBlock(x, y, z))`                         |
-| query "is process running"                 | `IBaritoneProcess.isActive()` on the relevant process (`mineProcess`, `customGoalProcess`)        |
+| start excavate                             | `IBaritone.getBuilderProcess().clearArea(BlockPos p1, BlockPos p2)`                               |
+| start fill                                 | `IBaritone.getBuilderProcess().build(String name, FillSchematic(w,h,d, prebuilt-BOM), Vec3i origin)` |
+| query "is process running"                 | `IBaritoneProcess.isActive()` on the relevant process (`mineProcess`, `customGoalProcess`, `builderProcess`) |
 | pathing state                              | `IBaritone.getPathingBehavior().isPathing()`                                                      |
-| path-calc events / failures                | `IGameEventListener.onPathEvent(PathEvent)` — `CALC_FAILED` (terminal for both endpoints), `AT_GOAL` (terminal for goto), `CANCELED` (terminal for goto, ignored by mine) |
+| path-calc events / failures                | `IGameEventListener.onPathEvent(PathEvent)` — `CALC_FAILED` (terminal for mine/goto), `AT_GOAL` (terminal for goto), `CANCELED` (terminal for goto, ignored by mine/excavate/fill) |
 | register the listener                      | `IBaritone.getGameEventHandler()` → `IEventBus.registerEventListener(IGameEventListener)`; extend `AbstractGameEventListener` for default no-op overrides |
 | cancel everything                          | `pathingBehavior.cancelEverything()` — return value is **not reliable** (returns `true` even when idle). Sample `isPathing()`/`isActive()` ourselves for the `acked` field. |
 
@@ -890,7 +1164,7 @@ All three endpoints drive Baritone through its public Java API rather than parsi
 
 **Threading.** All Baritone API calls happen on the game thread via `MinecraftClient.execute(...)` per `CLAUDE.md`. `IGameEventListener` callbacks also fire on the game thread; the per-call wait machinery publishes plain enum/outcome values across threads to the HTTP handlers blocking in `.get()`. **Exception**: `BlockOptionalMeta` construction is deliberately performed on the HTTP worker thread (off the render thread) to avoid the `drops()` deadlock — see "Off-thread BOM prewarm" in the mine endpoint section.
 
-**Cross-cutting locks.** A single `ReentrantLock` ("Baritone session lock") covers `/baritone/mine` and `/baritone/goto`. `/baritone/stop` deliberately does not take it. Lock acquisition is `tryLock` with zero wait; failure → `busy`. There is no queueing.
+**Cross-cutting locks.** A single `ReentrantLock` ("Baritone session lock") covers `/baritone/mine`, `/baritone/goto`, `/baritone/excavate`, and `/baritone/fill`. `/baritone/stop` deliberately does not take it. Lock acquisition is `tryLock` with zero wait; failure → `busy`. There is no queueing.
 
 ## Prerequisite: server-side recipe grant
 
@@ -909,6 +1183,44 @@ All three endpoints drive Baritone through its public Java API rather than parsi
 - **Synchronous.** Each request blocks until the operation completes or fails. Reasonable timeout (~5s) for safety.
 - **Atomic.** A craft either succeeds fully or makes no inventory changes. No partial states visible to the agent.
 - **Game-thread safe.** All game-state reads/writes go through `MinecraftClient.execute(...)` per `CLAUDE.md`.
+
+### `GET /scan_blocks` *(specified, not yet implemented)*
+
+Returns all non-air blocks in an axis-aligned bounding box. Read-only — no game state is modified.
+
+**Query parameters:** `x1`, `y1`, `z1`, `x2`, `y2`, `z2` — integer world coordinates (any corner order; endpoint normalises).
+
+**Volume cap:** 2000 blocks. Requests exceeding this return `invalid_request`.
+
+**Success response:**
+```json
+{
+  "box": [-4, 60, 24, 0, 63, 28],
+  "volume": 100,
+  "blocks": [
+    {"x": -3, "y": 61, "z": 25, "id": "minecraft:grass",      "passable": true},
+    {"x": -2, "y": 61, "z": 25, "id": "minecraft:tall_grass",  "passable": true},
+    {"x": -1, "y": 60, "z": 24, "id": "minecraft:stone",       "passable": false}
+  ]
+}
+```
+
+`blocks` is sparse — air positions are omitted. `volume` is the full box cell count (including omitted air), useful for computing fill %. `passable` is derived from `BlockState.getCollisionShape(level, pos).isEmpty()` on the game thread — true for blocks a player walks through (tall grass, flowers, snow layers, etc.) but that are not air.
+
+**Error reasons:**
+- `invalid_request` — non-integer coords or volume > 2000.
+- `out_of_range` — any chunk in the box is not loaded; move closer and retry.
+- `internal_error`, `timeout` — as other endpoints.
+
+**Composition note.** This endpoint is the general primitive. Higher-level operations like "trim passable blocks" are composed in `craft/tools.py` using this endpoint plus `/baritone/excavate`:
+
+```python
+# trim_passable(x1, y1, z1, x2, y2, z2):
+#   1. GET /scan_blocks → filter blocks where passable == true
+#   2. for each passable block: POST /baritone/excavate on that single position
+```
+
+The mod does not implement trim_passable; `craft/tools.py` does.
 
 ## Non-goals (v1)
 

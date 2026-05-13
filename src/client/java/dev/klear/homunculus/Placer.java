@@ -32,10 +32,11 @@ import java.util.concurrent.TimeoutException;
  * player toward it for the placement packet. The rotation is left in place — the spectator camera
  * stays on the placed block instead of snapping back to whatever the agent was last facing.
  *
- * Anti-casing precondition: at least 6 of the 8 ring-1 tiles around the player's feet must be open
- * (air or replaceable). If fewer, return {@code no_space} — placing in a tight pocket walls the
- * agent in. Candidate search prefers ring 2 over ring 1 to give the placed block breathing room
- * away from the player.
+ * Anti-casing precondition: at least {@code RING_1_OPEN_MIN} of the 8 ring-1 tiles around the
+ * player's feet must be open (air or replaceable). Default 3, override via env var
+ * {@code HOMUNCULUS_RING1_OPEN_MIN} (read at static init). If fewer, return {@code no_space} —
+ * placing in a tight pocket walls the agent in. Candidate search prefers ring 2 over ring 1 to
+ * give the placed block breathing room away from the player.
  *
  * Sneak is held through the call so a usable support block (e.g. a chest) doesn't pop its GUI.
  */
@@ -48,7 +49,20 @@ public final class Placer {
 	private static final long SNEAK_SETTLE_MS = 100;
 	private static final long PLACE_SETTLE_MS = 150;
 
-	private static final int RING_1_OPEN_MIN = 6;
+	private static final int RING_1_OPEN_MIN = readRing1OpenMin();
+
+	private static int readRing1OpenMin() {
+		String raw = System.getenv("HOMUNCULUS_RING1_OPEN_MIN");
+		if (raw == null || raw.isBlank()) return 3;
+		try {
+			int v = Integer.parseInt(raw.trim());
+			if (v < 0) v = 0;
+			if (v > 8) v = 8;
+			return v;
+		} catch (NumberFormatException e) {
+			return 3;
+		}
+	}
 
 	/** 8 tiles at Chebyshev distance 1 from the player's feet, NESW first then diagonals. */
 	private static final int[][] RING_1 = {

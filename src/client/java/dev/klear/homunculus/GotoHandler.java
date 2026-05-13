@@ -6,6 +6,7 @@ import com.sun.net.httpserver.HttpHandler;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -31,7 +32,9 @@ public final class GotoHandler implements HttpHandler {
                 return;
             }
 
-            Goto.Outcome outcome = Goto.run(req.x, req.y, req.z, req.timeoutSeconds, req.arrivalTolerance);
+            Goto.Options opts = new Goto.Options(req.allowPlace, req.throwawayItems, req.ensureThrowawayInHotbar);
+            Goto.Outcome outcome = Goto.run(
+                    req.goalType, req.x, req.y, req.z, req.timeoutSeconds, req.arrivalTolerance, opts);
             respond(exchange, 200, toBody(req, outcome));
         } finally {
             exchange.close();
@@ -43,17 +46,24 @@ public final class GotoHandler implements HttpHandler {
         if (outcome instanceof Goto.Arrived a) {
             body.put("success", true);
             body.put("reason", "arrived");
-            body.put("target", List.of(req.x, req.y, req.z));
+            body.put("target", targetList(req));
             body.put("final_position", positionList(a.finalPosition()));
             body.put("message", a.message());
         } else if (outcome instanceof Goto.Failed f) {
             body.put("success", false);
             body.put("reason", f.reason());
-            body.put("target", List.of(req.x, req.y, req.z));
+            body.put("target", targetList(req));
             body.put("final_position", positionList(f.finalPosition()));
             body.put("message", f.message());
         }
         return body;
+    }
+
+    private static Object targetList(Request req) {
+        return switch (req.goalType) {
+            case BLOCK -> List.of(req.x, req.y, req.z);
+            case Y_LEVEL -> Map.of("y", req.y);
+        };
     }
 
     private static Object positionList(double[] pos) {
@@ -61,24 +71,56 @@ public final class GotoHandler implements HttpHandler {
         return List.of(pos[0], pos[1], pos[2]);
     }
 
-    private record Request(int x, int y, int z, long timeoutSeconds, long arrivalTolerance) {}
+    private record Request(
+            Goto.GoalType goalType,
+            int x, int y, int z,
+            long timeoutSeconds,
+            long arrivalTolerance,
+            boolean allowPlace,
+            List<String> throwawayItems,
+            boolean ensureThrowawayInHotbar) {}
 
     private static Request parseBody(HttpExchange exchange) throws IOException {
         byte[] bytes = exchange.getRequestBody().readNBytes(MAX_BODY_BYTES + 1);
         if (bytes.length > MAX_BODY_BYTES) throw new IllegalArgumentException("body too large");
         String body = new String(bytes, StandardCharsets.UTF_8).trim();
         if (body.isEmpty()) throw new IllegalArgumentException("empty body");
-        Object parsed;
+        Object parsedJson;
         try {
-            parsed = Json.parse(body);
+            parsedJson = Json.parse(body);
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException("invalid JSON (" + e.getMessage() + ")");
         }
-        if (!(parsed instanceof Map<?, ?> m)) throw new IllegalArgumentException("expected JSON object");
+        if (!(parsedJson instanceof Map<?, ?> m)) throw new IllegalArgumentException("expected JSON object");
 
-        int x = requireInt(m, "x");
-        int y = requireInt(m, "y");
-        int z = requireInt(m, "z");
+        Goto.GoalType goalType = Goto.GoalType.BLOCK;
+        Object gtRaw = m.get("goal_type");
+        if (gtRaw instanceof String s) {
+            switch (s) {
+                case "block" -> goalType = Goto.GoalType.BLOCK;
+                case "y_level" -> goalType = Goto.GoalType.Y_LEVEL;
+                default -> throw new IllegalArgumentException(
+                        "'goal_type' must be \"block\" or \"y_level\" (got \"" + s + "\")");
+            }
+        } else if (gtRaw != null) {
+            throw new IllegalArgumentException("'goal_type' must be a string");
+        }
+
+        int x = 0, y, z = 0;
+        switch (goalType) {
+            case BLOCK -> {
+                x = requireInt(m, "x");
+                y = requireInt(m, "y");
+                z = requireInt(m, "z");
+            }
+            case Y_LEVEL -> {
+                y = requireInt(m, "y");
+                // x and z are accepted but unused — tolerate them silently for client schema uniformity.
+                if (m.get("x") != null) x = requireInt(m, "x");
+                if (m.get("z") != null) z = requireInt(m, "z");
+            }
+            default -> throw new IllegalStateException("unreachable");
+        }
 
         long timeoutSec = DEFAULT_TIMEOUT_SECONDS;
         Object timeoutRaw = m.get("timeout_seconds");
@@ -100,7 +142,38 @@ public final class GotoHandler implements HttpHandler {
             throw new IllegalArgumentException("'arrival_tolerance' must be a number");
         }
 
-        return new Request(x, y, z, timeoutSec, tolerance);
+        boolean allowPlace = true;
+        Object apRaw = m.get("allow_place");
+        if (apRaw instanceof Boolean b) {
+            allowPlace = b;
+        } else if (apRaw != null) {
+            throw new IllegalArgumentException("'allow_place' must be a boolean");
+        }
+
+        List<String> throwawayItems = null;
+        Object tiRaw = m.get("throwaway_items");
+        if (tiRaw instanceof List<?> rawList) {
+            List<String> parsed = new ArrayList<>(rawList.size());
+            for (Object o : rawList) {
+                if (!(o instanceof String s)) {
+                    throw new IllegalArgumentException("'throwaway_items' entries must be strings");
+                }
+                parsed.add(s);
+            }
+            throwawayItems = parsed;
+        } else if (tiRaw != null) {
+            throw new IllegalArgumentException("'throwaway_items' must be an array of strings");
+        }
+
+        boolean ensureInHotbar = false;
+        Object eRaw = m.get("ensure_throwaway_in_hotbar");
+        if (eRaw instanceof Boolean b) {
+            ensureInHotbar = b;
+        } else if (eRaw != null) {
+            throw new IllegalArgumentException("'ensure_throwaway_in_hotbar' must be a boolean");
+        }
+
+        return new Request(goalType, x, y, z, timeoutSec, tolerance, allowPlace, throwawayItems, ensureInHotbar);
     }
 
     private static int requireInt(Map<?, ?> m, String key) {

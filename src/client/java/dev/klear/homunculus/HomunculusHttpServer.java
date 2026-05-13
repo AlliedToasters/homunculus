@@ -35,6 +35,7 @@ public final class HomunculusHttpServer {
 		server.createContext("/position", new PositionHandler());
 		server.createContext("/scan_column", new ScanColumnHandler());
 		server.createContext("/scan_entities", new ScanEntitiesHandler());
+		server.createContext("/scan_blocks", new ScanBlocksHandler());
 		server.createContext("/stats", new StatsHandler());
 		server.createContext("/craft", new CraftHandler());
 		server.createContext("/place", new PlaceHandler());
@@ -50,11 +51,17 @@ public final class HomunculusHttpServer {
 			server.createContext("/baritone/mine", new MineHandler());
 			server.createContext("/baritone/goto", new GotoHandler());
 			server.createContext("/baritone/stop", new StopHandler());
+			server.createContext("/baritone/excavate", new ExcavateHandler());
+			server.createContext("/baritone/fill", new FillHandler());
+			server.createContext("/baritone/throwaway_items", new ThrowawayItemsHandler());
 		} else {
 			BaritoneStubHandler stub = new BaritoneStubHandler();
 			server.createContext("/baritone/mine", stub);
 			server.createContext("/baritone/goto", stub);
 			server.createContext("/baritone/stop", stub);
+			server.createContext("/baritone/excavate", stub);
+			server.createContext("/baritone/fill", stub);
+			server.createContext("/baritone/throwaway_items", stub);
 			HomunculusClient.LOGGER.warn("Baritone API not on classpath — /baritone/* will return baritone_not_loaded");
 		}
 		server.createContext("/", exchange -> {
