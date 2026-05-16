@@ -5,7 +5,7 @@
 	"name": "Homunculus",
 	"description": "Local HTTP API exposing inventory and crafting for the craft Minecraft agent.",
 	"authors": [
-		"Michael Klear"
+		"AlliedToasters"
 	],
 	"license": "MIT",
 	"environment": "client",

@@ -211,7 +211,7 @@ Returns a buffer of recent player deaths. The agent polls this after each tool c
   "deaths": [
     {
       "timestamp": 1715492142000,
-      "message": "MichaelKlear fell from a high place",
+      "message": "toast fell from a high place",
       "cause": "fall",
       "death_pos": [12, 8, -34],
       "respawn_pos": [-12, 64, 100]
