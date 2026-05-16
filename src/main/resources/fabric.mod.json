@@ -11,7 +11,7 @@
 	"environment": "client",
 	"entrypoints": {
 		"client": [
-			"dev.klear.homunculus.HomunculusClient"
+			"dev.toast.homunculus.HomunculusClient"
 		]
 	},
 	"depends": {
