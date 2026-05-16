@@ -98,6 +98,22 @@ public final class StatsHandler implements HttpHandler {
 
 		m.put("dimension", p.level().dimension().location().toString());
 
+		// Day-time: total ticks since world start. % 24000 = position in
+		// current day cycle (0=sunrise, 6000=noon, 12000=dusk, 18000=midnight).
+		// // 24000 = day count. Used by the agent harness to surface
+		// "minutes until nightfall" hints for survival prioritization.
+		long worldTime = p.level().getDayTime();
+		m.put("day_ticks", worldTime % 24000L);
+		m.put("day_count", worldTime / 24000L);
+
+		// Biome at the player's current block. Spawn biome is a strong
+		// confound for survival rollouts (forest = easy wood, desert = none,
+		// ocean = stranded) — log it per-turn so post-hoc analysis can bin by it.
+		String biomeId = p.level().getBiome(p.blockPosition()).unwrapKey()
+				.map(k -> k.location().toString())
+				.orElse("unknown");
+		m.put("biome", biomeId);
+
 		MultiPlayerGameMode gm = mc.gameMode;
 		m.put("gamemode", gm != null ? gm.getPlayerMode().getName() : null);
 

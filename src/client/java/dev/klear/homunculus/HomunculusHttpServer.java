@@ -36,14 +36,29 @@ public final class HomunculusHttpServer {
 		server.createContext("/scan_column", new ScanColumnHandler());
 		server.createContext("/scan_entities", new ScanEntitiesHandler());
 		server.createContext("/scan_blocks", new ScanBlocksHandler());
+		server.createContext("/scan_nearest", new ScanNearestHandler());
 		server.createContext("/stats", new StatsHandler());
 		server.createContext("/craft", new CraftHandler());
 		server.createContext("/place", new PlaceHandler());
+		server.createContext("/place_at", new PlaceAtHandler());
 		server.createContext("/equip", new EquipHandler());
 		server.createContext("/smelt", new SmeltHandler());
 		server.createContext("/smelt_status", new SmeltStatusHandler());
 		server.createContext("/collect_smelt", new CollectSmeltHandler());
 		server.createContext("/deaths", new DeathsHandler());
+		server.createContext("/debug/door_courtesy", new DoorCourtesyDebugHandler());
+		// Reflexive evasion — one handler, three paths. Python arms once per turn,
+		// optionally polls /status mid-turn, disarms at end. The watcher itself
+		// cancels Baritone and flees on hostile hit; handlers stay evasion-unaware.
+		EvasionHandler evasionHandler = new EvasionHandler();
+		server.createContext("/evasion/arm", evasionHandler);
+		server.createContext("/evasion/disarm", evasionHandler);
+		server.createContext("/evasion/status", evasionHandler);
+		// Wurst bridge: handlers self-check via Wurst.isApiLoaded() and return
+		// wurst_not_loaded if the Wurst jar isn't on the runtime classpath, so
+		// no separate stub-handler dance like /baritone/* needs.
+		server.createContext("/wurst/hack", new WurstHackHandler());
+		server.createContext("/wurst/status", new WurstStatusHandler());
 		// /baritone/mine: BOM construction is prewarmed off the render thread to dodge the
 		// BlockOptionalMeta.drops() deadlock (see MineHandler.runMine). If this turns out to
 		// still hang, drop /baritone/mine from the route table and revert to xdotool #mine.
@@ -54,6 +69,7 @@ public final class HomunculusHttpServer {
 			server.createContext("/baritone/excavate", new ExcavateHandler());
 			server.createContext("/baritone/fill", new FillHandler());
 			server.createContext("/baritone/throwaway_items", new ThrowawayItemsHandler());
+			server.createContext("/baritone/allow_break", new AllowBreakHandler());
 		} else {
 			BaritoneStubHandler stub = new BaritoneStubHandler();
 			server.createContext("/baritone/mine", stub);
@@ -62,6 +78,7 @@ public final class HomunculusHttpServer {
 			server.createContext("/baritone/excavate", stub);
 			server.createContext("/baritone/fill", stub);
 			server.createContext("/baritone/throwaway_items", stub);
+			server.createContext("/baritone/allow_break", stub);
 			HomunculusClient.LOGGER.warn("Baritone API not on classpath — /baritone/* will return baritone_not_loaded");
 		}
 		server.createContext("/", exchange -> {

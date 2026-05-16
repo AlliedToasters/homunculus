@@ -18,6 +18,8 @@ import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.DoorBlock;
+import net.minecraft.world.level.block.FenceGateBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
@@ -136,6 +138,100 @@ public final class Placer {
 		}
 	}
 
+	/**
+	 * Place a block at an explicit target coordinate (caller-chosen, no candidate search).
+	 *
+	 * <p>The agent stands wherever it stands; we don't move it. We only verify:
+	 * <ul>
+	 *   <li>item exists, is a BlockItem, and is in inventory
+	 *   <li>target cell is air/replaceable (placement won't overwrite something)
+	 *   <li>support block (target.below()) is sturdy on its top face
+	 *   <li>support top is within ~5.5 blocks of the player's eyes (MC reach)
+	 * </ul>
+	 *
+	 * <p>Skips the ring-1 open-tiles "anti-casing" check that {@link #place} uses —
+	 * the agent is choosing where to place, so blocking themselves in is their
+	 * problem, not ours.
+	 *
+	 * <p>Doors and other multi-block items: only the bottom coord is specified;
+	 * MC's BlockItem.useOn auto-handles the upper half. If the cell above target
+	 * is not air, the place will fail at the verify step.
+	 */
+	public static Result placeAt(String itemIdStr, BlockPos target) throws InterruptedException {
+		ResourceLocation itemId = ResourceLocation.tryParse(itemIdStr);
+		if (itemId == null || !BuiltInRegistries.ITEM.containsKey(itemId)) {
+			return new Failure("not_placeable", "no item with id '" + itemIdStr + "'");
+		}
+		Item item = BuiltInRegistries.ITEM.getValue(itemId);
+		if (!(item instanceof BlockItem blockItem)) {
+			return new Failure("not_placeable", "item '" + itemIdStr + "' is not a block");
+		}
+		Block expectedBlock = blockItem.getBlock();
+		Minecraft mc = Minecraft.getInstance();
+		BlockPos support = target.below();
+
+		Failure preFailure = supply(() -> precheckAt(mc, item, itemIdStr, target, support));
+		if (preFailure != null) return preFailure;
+
+		Failure selectFailure = supply(() -> selectForPlacement(mc, item, itemIdStr));
+		if (selectFailure != null) return selectFailure;
+		Thread.sleep(SELECT_SETTLE_MS);
+
+		Boolean rotated = supply(() -> { Look.faceBlockTop(mc, support); return mc.player != null; });
+		if (rotated == null || !rotated) return new Failure("internal_error", "player vanished during rotate");
+		Thread.sleep(ROT_SETTLE_MS);
+
+		Boolean priorShift = supply(() -> beginSneak(mc));
+		if (priorShift == null) {
+			return new Failure("internal_error", "player vanished after rotate");
+		}
+
+		try {
+			Thread.sleep(SNEAK_SETTLE_MS);
+			supply(() -> { sendPlacePacket(mc, support); return null; });
+			Thread.sleep(PLACE_SETTLE_MS);
+			return supply(() -> verifyPlacement(mc, target, expectedBlock, itemIdStr));
+		} finally {
+			final boolean restore = priorShift;
+			supply(() -> { endSneak(mc, restore); return null; });
+		}
+	}
+
+	private static Failure precheckAt(Minecraft mc, Item item, String itemIdStr, BlockPos target, BlockPos support) {
+		LocalPlayer p = mc.player;
+		if (p == null) return new Failure("internal_error", "no player (not in world)");
+		if (mc.gameMode == null) return new Failure("internal_error", "no gameMode");
+		ClientLevel level = mc.level;
+		if (level == null) return new Failure("internal_error", "no level");
+		if (p.containerMenu != p.inventoryMenu) {
+			return new Failure("internal_error",
+					"another inventory screen is open; close it before placing");
+		}
+		if (scan(p.getInventory().items, item) < 0) {
+			return new Failure("not_in_inventory", "no '" + itemIdStr + "' in inventory");
+		}
+		if (!isOpenForPlacement(level, target)) {
+			BlockState s = level.getBlockState(target);
+			return new Failure("target_blocked",
+					"target " + target + " is " + BuiltInRegistries.BLOCK.getKey(s.getBlock())
+							+ " (need air/replaceable)");
+		}
+		BlockState supportState = level.getBlockState(support);
+		if (!supportState.isFaceSturdy(level, support, Direction.UP)) {
+			return new Failure("no_sturdy_support",
+					"block below target (" + support + ") top face not sturdy — was "
+							+ BuiltInRegistries.BLOCK.getKey(supportState.getBlock()));
+		}
+		Vec3 supportTop = new Vec3(support.getX() + 0.5, support.getY() + 1.0, support.getZ() + 0.5);
+		double dist = p.getEyePosition().distanceTo(supportTop);
+		if (dist > 5.5) {
+			return new Failure("out_of_reach",
+					"support top is " + String.format(java.util.Locale.ROOT, "%.2f", dist)
+							+ " blocks from player eyes (max ~5.5)");
+		}
+		return null;
+	}
+
 	private record SearchOutcome(BlockPos target, Failure failure) {
 		static SearchOutcome ok(BlockPos t) { return new SearchOutcome(t, null); }
 		static SearchOutcome fail(Failure f) { return new SearchOutcome(null, f); }
@@ -167,14 +263,45 @@ public final class Placer {
 							+ RING_1_OPEN_MIN + "+) — relocate to open ground"));
 		}
 
+		// Doorway guard: any candidate cell that IS a door/gate, or sits at the
+		// same y as a door/gate within 1 cardinal step, would block egress
+		// when filled. Scan a 5x4x5 box around the player's feet for door-
+		// or gate-blocks and accumulate their 5-cell footprint (the door
+		// cell + 4 cardinal neighbors at the door's y).
+		java.util.Set<Long> doorwayForbidden = new java.util.HashSet<>();
+		for (int dx = -2; dx <= 2; dx++) {
+			for (int dy = -1; dy <= 2; dy++) {
+				for (int dz = -2; dz <= 2; dz++) {
+					BlockPos bp = feet.offset(dx, dy, dz);
+					Block b = level.getBlockState(bp).getBlock();
+					if (b instanceof DoorBlock || b instanceof FenceGateBlock) {
+						doorwayForbidden.add(bp.asLong());
+						doorwayForbidden.add(bp.north().asLong());
+						doorwayForbidden.add(bp.south().asLong());
+						doorwayForbidden.add(bp.east().asLong());
+						doorwayForbidden.add(bp.west().asLong());
+					}
+				}
+			}
+		}
+
 		for (int[] off : SEARCH_ORDER) {
 			BlockPos cand = feet.offset(off[0], 0, off[1]);
+			if (doorwayForbidden.contains(cand.asLong())) continue;
 			if (!isOpenForPlacement(level, cand)) continue;
 			BlockPos below = cand.below();
 			BlockState supportState = level.getBlockState(below);
 			if (supportState.isFaceSturdy(level, below, Direction.UP)) {
 				return SearchOutcome.ok(cand);
 			}
+		}
+		// If we got here and the doorway-set is non-empty, the agent was
+		// near a door but every plausible candidate touched the doorway —
+		// surface that as a distinct reason so the LLM can step away rather
+		// than retry indefinitely.
+		if (!doorwayForbidden.isEmpty()) {
+			return SearchOutcome.fail(new Failure("blocks_doorway",
+					"every candidate placement would block a nearby door/gate — step away (travel 2-3 blocks) before placing"));
 		}
 		return SearchOutcome.fail(new Failure("no_placeable_spot",
 				"no flat ground within 2 blocks of player (open above, sturdy below) — relocate and retry"));

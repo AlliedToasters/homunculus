@@ -91,6 +91,16 @@ public final class SmeltHandler implements HttpHandler {
 					Thread.currentThread().interrupt();
 					respond(exchange, 500, failureBody("internal_error", "interrupted during auto-place"));
 					return;
+				} catch (RuntimeException e) {
+					// Without this catch, any RuntimeException from Placer.place
+					// propagates out, the finally{} closes the exchange WITHOUT a
+					// response, and the Python client sees "Remote end closed
+					// connection without response" — observed r10 8x consecutive
+					// smelt failures (T18/19/22/24/25/26/38/39), agent never reached
+					// iron tier. Surface a structured 500 instead.
+					HomunculusClient.LOGGER.error("smelt auto-place failed", e);
+					respond(exchange, 500, failureBody("internal_error", "auto-place threw: " + rootMessage(e)));
+					return;
 				}
 				if (placeRes instanceof Placer.Failure pf) {
 					respond(exchange, 200, failureBody(pf.reason(), pf.message()));

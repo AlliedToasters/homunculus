@@ -9,7 +9,7 @@ import java.io.IOException;
 
 public final class HomunculusClient implements ClientModInitializer {
 	public static final String MOD_ID = "homunculus";
-	public static final int HTTP_PORT = 25566;
+	public static final int HTTP_PORT = Integer.getInteger("homunculus.port", 25566);
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
 	private final HomunculusHttpServer httpServer = new HomunculusHttpServer(HTTP_PORT);
@@ -18,6 +18,8 @@ public final class HomunculusClient implements ClientModInitializer {
 	public void onInitializeClient() {
 		DeathTracker.register();
 		FurnaceTicker.register();
+		DoorCourtesy.register();
+		Evasion.register();
 		ClientLifecycleEvents.CLIENT_STARTED.register(client -> {
 			try {
 				httpServer.start();

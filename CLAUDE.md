@@ -45,7 +45,7 @@ The HTTP handler runs on the HTTP server's thread, which is **not** the game thr
 - Localhost-only bind
 - Inventory-only crafts in v1
 - Sibling repo (this directory), not nested in `craft/`
-- Wurst stays runtime-only and the mod does not interact with it
+- Wurst was originally runtime-only; that constraint was lifted on 2026-05-14 when the `/wurst/hack` + `/wurst/status` bridge landed (reflection-only against `net.wurstclient.WurstClient.INSTANCE`, so no compile-time dep on Wurst). Toggling KillAura/AutoEat/AutoTool from the harness is now a load-bearing substrate primitive — see `Wurst.java` + `WurstHackHandler.java` + `WurstStatusHandler.java`.
 
 ## How to proceed
 

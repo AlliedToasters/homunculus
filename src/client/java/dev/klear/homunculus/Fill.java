@@ -50,6 +50,14 @@ public final class Fill {
     private static final long GAME_THREAD_TIMEOUT_MS = 5_000;
     private static final long DEFAULT_START_WINDOW_SECONDS = 15;
     private static final long BOM_PREWARM_TIMEOUT_MS = 30_000;
+    // Stuck watchdog: while builder is active+unpaused, sample air-cell count
+    // every PROGRESS_CHECK_INTERVAL_MS; if no decrease for STUCK_THRESHOLD_MS,
+    // bail with "stuck". Catches the BuilderProcess-thrashing case where path
+    // calc fails repeatedly (e.g., placement target has no anchor neighbor),
+    // PathExecutor self-cancels, builder re-plans, same failure — isActive
+    // stays true and isPaused stays false, so neither existing exit fires.
+    private static final long PROGRESS_CHECK_INTERVAL_MS = 2_000;
+    private static final long STUCK_THRESHOLD_MS = 20_000;
 
     public sealed interface Outcome permits Filled, Failed {
         int[] box();
@@ -185,6 +193,11 @@ public final class Fill {
         long deadline = now + timeoutMs;
         boolean wentActive = false;
         int lastRemaining = preAir;
+        // Watchdog state. lastProgressMs resets whenever the air count
+        // strictly decreases; if it stays put past STUCK_THRESHOLD_MS we
+        // declare the build stuck even though Baritone still reports active.
+        long lastProgressMs = now;
+        long nextProgressCheckMs = now + PROGRESS_CHECK_INTERVAL_MS;
 
         try {
             while (true) {
@@ -203,8 +216,32 @@ public final class Fill {
                             "start window elapsed without builderProcess going active",
                             box, volume, remaining, blockId);
                 }
-                long wait = (wentActive ? deadline : Math.min(deadline, startDeadline)) - t;
+                // Cap poll wait at the next progress-check tick once active so
+                // we sample air-count even if no Baritone TickSignals arrive.
+                long bound = wentActive ? Math.min(deadline, nextProgressCheckMs)
+                                        : Math.min(deadline, startDeadline);
+                long wait = Math.max(0L, bound - t);
                 Signal sig = queue.poll(wait, TimeUnit.MILLISECONDS);
+
+                // Progress watchdog: only meaningful once the builder has gone
+                // active. Sample air-count at the configured cadence; if the
+                // count strictly decreases, reset the stall timer.
+                if (wentActive && System.currentTimeMillis() >= nextProgressCheckMs) {
+                    int current = safeAirCount(box, lastRemaining);
+                    long tNow = System.currentTimeMillis();
+                    if (current < lastRemaining) {
+                        lastRemaining = current;
+                        lastProgressMs = tNow;
+                    }
+                    nextProgressCheckMs = tNow + PROGRESS_CHECK_INTERVAL_MS;
+                    if (tNow - lastProgressMs >= STUCK_THRESHOLD_MS) {
+                        return new Failed("stuck",
+                                "no fill progress in " + STUCK_THRESHOLD_MS + "ms; "
+                                        + current + " of " + volume + " cells still air",
+                                box, volume, current, blockId);
+                    }
+                }
+
                 if (sig == null) continue;
 
                 if (sig instanceof TickSignal ts) {

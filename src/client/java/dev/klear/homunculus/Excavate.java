@@ -48,6 +48,14 @@ public final class Excavate {
     private static final long GAME_THREAD_TIMEOUT_MS = 5_000;
     private static final long DEFAULT_START_WINDOW_SECONDS = 15;
     private static final long BOM_PREWARM_TIMEOUT_MS = 30_000;
+    // Stuck watchdog: while builder is active+unpaused, sample remaining
+    // non-air count every PROGRESS_CHECK_INTERVAL_MS; if no decrease for
+    // STUCK_THRESHOLD_MS, bail with "stuck". Mirrors the Fill watchdog —
+    // same thrashing failure mode (path calc fails repeatedly, builder
+    // re-plans, no observable state change) shows up here when a block
+    // can't be reached for breaking.
+    private static final long PROGRESS_CHECK_INTERVAL_MS = 2_000;
+    private static final long STUCK_THRESHOLD_MS = 20_000;
 
     /** Blocks the builder will leave in place (skipped during clear). Matches the Reddit
      * "buildIgnoreBlocks torch" recipe — preserves player-placed lighting if the caller is
@@ -160,6 +168,11 @@ public final class Excavate {
         long deadline = now + timeoutMs;
         boolean wentActive = false;
         int lastRemaining = preCount;
+        // Watchdog state — same shape as Fill. lastProgressMs resets whenever
+        // remaining strictly decreases; if it stays put past STUCK_THRESHOLD_MS
+        // we declare excavate stuck even though Baritone still reports active.
+        long lastProgressMs = now;
+        long nextProgressCheckMs = now + PROGRESS_CHECK_INTERVAL_MS;
 
         try {
             while (true) {
@@ -178,8 +191,27 @@ public final class Excavate {
                             "start window elapsed without builderProcess going active",
                             box, volume, remaining);
                 }
-                long wait = (wentActive ? deadline : Math.min(deadline, startDeadline)) - t;
+                long bound = wentActive ? Math.min(deadline, nextProgressCheckMs)
+                                        : Math.min(deadline, startDeadline);
+                long wait = Math.max(0L, bound - t);
                 Signal sig = queue.poll(wait, TimeUnit.MILLISECONDS);
+
+                if (wentActive && System.currentTimeMillis() >= nextProgressCheckMs) {
+                    int current = safeRemaining(box, lastRemaining);
+                    long tNow = System.currentTimeMillis();
+                    if (current < lastRemaining) {
+                        lastRemaining = current;
+                        lastProgressMs = tNow;
+                    }
+                    nextProgressCheckMs = tNow + PROGRESS_CHECK_INTERVAL_MS;
+                    if (tNow - lastProgressMs >= STUCK_THRESHOLD_MS) {
+                        return new Failed("stuck",
+                                "no excavate progress in " + STUCK_THRESHOLD_MS + "ms; "
+                                        + current + " of " + volume + " blocks unbroken",
+                                box, volume, current);
+                    }
+                }
+
                 if (sig == null) continue;
 
                 if (sig instanceof TickSignal ts) {

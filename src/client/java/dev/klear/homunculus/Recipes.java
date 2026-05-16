@@ -142,14 +142,24 @@ public final class Recipes {
 		int batches = (count + perBatch - 1) / perBatch;
 		int totalOutput = batches * perBatch;
 
+		// Compute inventory FIRST so canonicalItem() can prefer items the
+		// player actually holds — critical for tag-based ingredients like
+		// #planks. Without this, every wood-derived recipe demands the
+		// FIRST item in the tag (oak_planks), even when the player has
+		// hundreds of birch_planks. Observed in probe-validate-r5 T12+:
+		// birch-forest spawn, 116 birch_planks, crafting_table loop-fails
+		// because canonicalItem returned oak_planks unconditionally.
+		Map<Item, Integer> have = inventoryCounts(mc);
+
 		Map<Item, Integer> required = new LinkedHashMap<>();
+		Map<Item, Integer> consumed = new LinkedHashMap<>();
 		for (Ingredient ing : ingredients) {
-			Item canonical = canonicalItem(ing);
+			Item canonical = canonicalItem(ing, have, consumed, batches);
 			if (canonical == null) continue;
 			required.merge(canonical, batches, Integer::sum);
+			consumed.merge(canonical, batches, Integer::sum);
 		}
 
-		Map<Item, Integer> have = inventoryCounts(mc);
 		List<MissingItem> missing = new ArrayList<>();
 		for (var e : required.entrySet()) {
 			int gap = e.getValue() - have.getOrDefault(e.getKey(), 0);
@@ -188,8 +198,19 @@ public final class Recipes {
 	}
 
 	@SuppressWarnings("deprecation")  // Ingredient.items() is the only public surface for canonical lookup in 1.21.4
-	private static Item canonicalItem(Ingredient ing) {
-		return ing.items().findFirst().map(Holder::value).orElse(null);
+	private static Item canonicalItem(Ingredient ing, Map<Item, Integer> have, Map<Item, Integer> consumed, int needPerSlot) {
+		// Prefer any tag-matching item the player has enough of, after
+		// subtracting prior slots' allocations. Falls back to the first
+		// tag item for the "no candidates" case (which will surface as
+		// a missing-ingredient error using the canonical id).
+		Item fallback = null;
+		for (var holder : ing.items().toList()) {
+			Item item = holder.value();
+			if (fallback == null) fallback = item;
+			int available = have.getOrDefault(item, 0) - consumed.getOrDefault(item, 0);
+			if (available >= needPerSlot) return item;
+		}
+		return fallback;
 	}
 
 	private static Map<Item, Integer> inventoryCounts(Minecraft mc) {
