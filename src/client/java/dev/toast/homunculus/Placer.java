@@ -263,48 +263,53 @@ public final class Placer {
 							+ RING_1_OPEN_MIN + "+) — relocate to open ground"));
 		}
 
-		// Doorway guard: any candidate cell that IS a door/gate, or sits at the
-		// same y as a door/gate within 1 cardinal step, would block egress
-		// when filled. Scan a 5x4x5 box around the player's feet for door-
-		// or gate-blocks and accumulate their 5-cell footprint (the door
-		// cell + 4 cardinal neighbors at the door's y).
-		java.util.Set<Long> doorwayForbidden = new java.util.HashSet<>();
-		for (int dx = -2; dx <= 2; dx++) {
-			for (int dy = -1; dy <= 2; dy++) {
-				for (int dz = -2; dz <= 2; dz++) {
-					BlockPos bp = feet.offset(dx, dy, dz);
-					Block b = level.getBlockState(bp).getBlock();
-					if (b instanceof DoorBlock || b instanceof FenceGateBlock) {
-						doorwayForbidden.add(bp.asLong());
-						doorwayForbidden.add(bp.north().asLong());
-						doorwayForbidden.add(bp.south().asLong());
-						doorwayForbidden.add(bp.east().asLong());
-						doorwayForbidden.add(bp.west().asLong());
-					}
-				}
-			}
-		}
-
+		// Doorway guard. Per-candidate: reject if `cand` is itself a door/
+		// gate, or has a door/gate as a cardinal neighbor (checked at the
+		// candidate's y and ±1 y to cover door upper halves + elevated
+		// supports). Cardinal-only because doors are flat — a diagonal
+		// block beside a door does not wall off the 2-tall passage.
+		//
+		// Per-candidate replaces the prior "scan box around feet" approach
+		// which missed doors at the candidate's far side (ring-2 candidates
+		// at offset ±2 can sit 1 cell from a door at offset ±3, which the
+		// old ±2 scan box never saw — shelter doorway repro).
+		boolean sawDoorAdjacent = false;
 		for (int[] off : SEARCH_ORDER) {
 			BlockPos cand = feet.offset(off[0], 0, off[1]);
-			if (doorwayForbidden.contains(cand.asLong())) continue;
 			if (!isOpenForPlacement(level, cand)) continue;
+			if (blocksDoorway(level, cand)) {
+				sawDoorAdjacent = true;
+				continue;
+			}
 			BlockPos below = cand.below();
 			BlockState supportState = level.getBlockState(below);
 			if (supportState.isFaceSturdy(level, below, Direction.UP)) {
 				return SearchOutcome.ok(cand);
 			}
 		}
-		// If we got here and the doorway-set is non-empty, the agent was
-		// near a door but every plausible candidate touched the doorway —
-		// surface that as a distinct reason so the LLM can step away rather
-		// than retry indefinitely.
-		if (!doorwayForbidden.isEmpty()) {
+		if (sawDoorAdjacent) {
 			return SearchOutcome.fail(new Failure("blocks_doorway",
 					"every candidate placement would block a nearby door/gate — step away (travel 2-3 blocks) before placing"));
 		}
 		return SearchOutcome.fail(new Failure("no_placeable_spot",
 				"no flat ground within 2 blocks of player (open above, sturdy below) — relocate and retry"));
+	}
+
+	private static boolean blocksDoorway(ClientLevel level, BlockPos cand) {
+		for (int dy = -1; dy <= 1; dy++) {
+			BlockPos at = cand.offset(0, dy, 0);
+			if (isDoorOrGate(level, at)) return true;
+			if (isDoorOrGate(level, at.north())) return true;
+			if (isDoorOrGate(level, at.south())) return true;
+			if (isDoorOrGate(level, at.east())) return true;
+			if (isDoorOrGate(level, at.west())) return true;
+		}
+		return false;
+	}
+
+	private static boolean isDoorOrGate(ClientLevel level, BlockPos pos) {
+		Block b = level.getBlockState(pos).getBlock();
+		return b instanceof DoorBlock || b instanceof FenceGateBlock;
 	}
 
 	private static boolean isOpenForPlacement(ClientLevel level, BlockPos pos) {

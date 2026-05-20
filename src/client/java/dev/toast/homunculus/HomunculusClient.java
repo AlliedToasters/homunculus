@@ -20,6 +20,7 @@ public final class HomunculusClient implements ClientModInitializer {
 		FurnaceTicker.register();
 		DoorCourtesy.register();
 		Evasion.register();
+		WaterAversion.register();
 		ClientLifecycleEvents.CLIENT_STARTED.register(client -> {
 			try {
 				httpServer.start();

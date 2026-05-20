@@ -54,6 +54,12 @@ public final class HomunculusHttpServer {
 		server.createContext("/evasion/arm", evasionHandler);
 		server.createContext("/evasion/disarm", evasionHandler);
 		server.createContext("/evasion/status", evasionHandler);
+		// Reflexive water aversion — same shape: arm once per turn, /status polls, /disarm at end.
+		// Trigger is eye-submergence; destination is computed at fire time (no anchor in /arm body).
+		WaterAversionHandler waterAversionHandler = new WaterAversionHandler();
+		server.createContext("/water_aversion/arm", waterAversionHandler);
+		server.createContext("/water_aversion/disarm", waterAversionHandler);
+		server.createContext("/water_aversion/status", waterAversionHandler);
 		// Wurst bridge: handlers self-check via Wurst.isApiLoaded() and return
 		// wurst_not_loaded if the Wurst jar isn't on the runtime classpath, so
 		// no separate stub-handler dance like /baritone/* needs.
