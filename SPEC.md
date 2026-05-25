@@ -1141,6 +1141,107 @@ POST /baritone/fill      { block: "cobblestone", floor slice (y1==y2==shelter_fl
 ```
 The excavate pass clears any natural ground irregularities first; the fill pass then plugs the (now-airy) floor with a solid slab. Walls / ceiling are the same pattern with different slices.
 
+### `POST /wurst/setting` *(implemented)*
+
+Generalises the existing `/wurst/hack` reflection bridge from "toggle the module" to "configure the module's settings." First-class motivation is AutoDrop's `Items` filter — the craft side wants an aggressive whitelist policy ("drop everything except items relevant to the current tech tier") that grows as the agent progresses (wood → stone → iron → diamond). The setting that controls this is `AutoDrop.Items`, an `ItemListSetting` whose default value is the literal string `"default"` in `wurst/settings.json` and whose configured shape is a JSON array of `minecraft:<id>` strings. We can't edit it pre-launch and call it done — tech-tier ramps need to mutate it mid-rollout, and the file is read at startup only. Hence: an HTTP surface that reflects into Wurst's setting machinery.
+
+**Scope.** Two routing paths:
+
+1. **`ItemListSetting`** — op-aware mutation (`replace` / `add` / `remove` / `reset`) of an ArrayList of `minecraft:<id>` strings. This is the original AutoDrop path; it preserves the registry-resolution + partial-fail posture documented below.
+2. **Everything else** — `CheckboxSetting`, `SliderSetting`, `EnumSetting`, `BlockListSetting`, `TextFieldSetting`, … — delegate to `Setting.fromJson(JsonElement)`. The request's `value` is converted to a `JsonElement` and handed to the setting; the subclass decides whether the shape is acceptable. `op` is rejected on this path with `bad_request` — it only applies to `ItemListSetting`.
+
+The motivating reflection chain is:
+
+```
+net.wurstclient.Feature.getSettings() -> Map<String, Setting>     // settings registry per hack
+net.wurstclient.settings.Setting:
+  fromJson(JsonElement)                                            // every subclass implements this
+  toJson() -> JsonElement
+net.wurstclient.settings.ItemListSetting:                          // op-aware mutation
+  getItemNames() -> List<String>                                  // current values, e.g. ["minecraft:dirt", ...]
+  add(net.minecraft.world.item.Item)
+  remove(int index)
+  resetToDefaults()
+  fromJson(JsonElement)                                            // "default" string sentinel or JSON array of ids
+```
+
+Confirmed via `javap -p` against `Wurst-Client-v7.51.2-MC1.21.4.jar`. Wurst writes the literal string `"default"` to `settings.json` when the in-memory list equals the built-in defaults; on read, the same sentinel triggers `Arrays.asList(defaultNames)` to be loaded. Our endpoint mirrors this: a `replace` with an empty body OR an explicit `reset` op restores defaults; otherwise the supplied id list becomes the new value.
+
+**Request body (ItemListSetting path):**
+```json
+{
+  "hack": "AutoDrop",
+  "setting": "Items",
+  "op": "replace",
+  "value": ["minecraft:dirt", "minecraft:cobblestone", "minecraft:sand"]
+}
+```
+
+**Request body (generic `fromJson` path):**
+```json
+{"hack":"KillAura","setting":"Filter passive mobs","value":false}
+{"hack":"AutoEat","setting":"Min hunger","value":12}
+{"hack":"AutoTool","setting":"Repair mode","value":"breaks soonest"}
+```
+
+| Field     | Type            | Required | Notes                                                                                                                                |
+|-----------|-----------------|----------|--------------------------------------------------------------------------------------------------------------------------------------|
+| `hack`    | string          | yes      | Case-insensitive, same matching rules as `/wurst/hack`.                                                                              |
+| `setting` | string          | yes      | Exact-match against `Feature.getSettings()` keys. Case-insensitive fallback if no exact hit (parallel to hack lookup).               |
+| `op`      | string          | no       | ItemListSetting only. One of `replace` (default), `add`, `remove`, `reset`. Rejected with `bad_request` on any other setting type.   |
+| `value`   | any JSON        | yes      | Shape depends on the target setting subclass: array of strings for ItemList/BlockList, boolean for Checkbox, number for Slider, string for Enum, etc. Validated by `Setting.fromJson` on the generic path. |
+
+**Item id resolution.** Strings are normalised through `ResourceLocation.tryParse` + `BuiltInRegistries.ITEM.containsKey`. Unknown ids fail the whole request with `unknown_item_id` and a list of which entries didn't resolve — same posture as `/baritone/throwaway_items`. Partial application is not allowed.
+
+**Success response:**
+```json
+{
+  "success": true,
+  "hack": "AutoDrop",
+  "setting": "Items",
+  "op": "replace",
+  "before": ["minecraft:poppy", "minecraft:dandelion", "minecraft:wheat_seeds"],
+  "after":  ["minecraft:dirt", "minecraft:cobblestone", "minecraft:sand"],
+  "is_default_after": false
+}
+```
+
+`before` and `after` are the resolved item-id lists snapshotted on the game thread, immediately before and after the mutation. `is_default_after` reports whether `after` equals the setting's built-in defaults — useful for the caller to know "would Wurst now serialize this as `'default'` in settings.json?" without re-checking.
+
+**Success response (generic `fromJson` path):**
+```json
+{
+  "success": true,
+  "hack": "KillAura",
+  "setting": "Filter passive mobs",
+  "type": "FilterPassiveSetting",
+  "changed": true
+}
+```
+
+`type` is the concrete Setting subclass name; `changed` is computed by comparing `toJson()` before and after the call. No `before`/`after` snapshot on this path — the caller knows what value it sent.
+
+**Failure response (standard shape):** `{success:false, reason, message}` with `reason` ∈ {`wurst_not_loaded`, `hack_not_found`, `setting_not_found`, `unsupported_setting_type`, `unknown_item_id`, `wrong_value_type`, `bad_request`, `internal_error`}. `unknown_item_id` carries an extra `unknown: [string, ...]` field listing the rejected entries (mirrors `/baritone/throwaway_items`). `wrong_value_type` is returned when `Setting.fromJson` throws — typically `JsonParseException` (e.g. sending a number to a CheckboxSetting) — or when the ItemListSetting path receives a non-array `value`.
+
+**GET sibling — `GET /wurst/setting?hack=AutoDrop&setting=Items`** *(specified, not yet implemented)*. Returns the current resolved list without mutating. Same response shape as the success body above, minus `op` and `before` (only `after`). Lets the agent or operator inspect what's currently in force — important for debugging tech-tier ramps where the whitelist drifts over a long rollout.
+
+**Body size.** The handler must accept payloads up to at least 128KB. A full ItemListSetting can carry ~1400 ids × ~50 chars ≈ 70KB; doubling that gives headroom. The `/wurst/hack` handler's 1024-byte cap is way too tight here. Recommend 256KB as a round cap.
+
+**Threading + persistence.** Mutations run on the client thread (Wurst's `ItemListSetting.add()` updates an `ArrayList` that's read by `AutoDropHack`'s tick handler on the same thread). The change is in-memory and applies on the next tick; AutoDrop has no internal cache. Wurst auto-persists settings when its disk-flush cycle fires (existing behavior — we don't trigger writes ourselves), so the change survives in `wurst/settings.json` for the rest of the session and across `/wurst/hack` toggles. It does **not** survive a JVM restart unless Wurst has flushed by then; callers that need pre-launch state should keep writing `wurst/settings.json` directly.
+
+**Open design decision: item-registry exposure.** The motivating policy ("drop everything except this whitelist") needs the complement of the whitelist, i.e. the full set of vanilla item ids. Two options:
+
+1. **Craft-side computes the complement** from a hardcoded list of MC item ids (~1100 entries, mostly stable across MC versions). Bloats the brain repo but keeps the protocol simple.
+2. **New `GET /items`** endpoint returns `BuiltInRegistries.ITEM.keySet()` as a sorted JSON array. Authoritative per-server (catches mod items) but adds a new endpoint for one use case.
+
+Recommend option 1 for v1 (the whitelist policy already lives in Python; adding a hardcoded id list is one more constant). Revisit if a modded server use case shows up.
+
+**Open design decision: `add` and `remove` semantics on duplicates.** `ItemListSetting` deduplicates internally (the `fromJson` bytecode shows `distinct().sorted()` over the incoming list), so `add` of an already-present id is a no-op and `remove` of an absent id is too. Reporting these as success-with-no-change is fine and matches the existing `/wurst/hack` `changed: bool` pattern. The response should include a `changed: bool` field to distinguish "request was valid and applied" from "request was valid but already at target state."
+
+**Why not just edit `wurst/settings.json`.** File is read once at Wurst startup. Hot-edits to it don't trigger a reload; Wurst will eventually clobber the file with its in-memory state. The reflection path is the only safe runtime mutation surface.
+
+**Why not extend `/wurst/hack`.** Toggle and setting-mutation are different operations with different validation rules and failure modes. Reusing the path would force `enabled` to be optional and `setting`/`value` to be optional, breaking the existing handler's request schema. Cheaper to add a sibling endpoint.
+
 ### Baritone API integration (shared)
 
 All five endpoints drive Baritone through its public Java API rather than parsing chat. The relevant surface:

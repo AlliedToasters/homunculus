@@ -61,7 +61,7 @@ Primary dev loop is manual curl + watching the game. No automated test framework
 ## When to ask vs just decide
 
 - **Just decide and document:** package name, port number, JSON field naming, Gradle/loom minutiae, choice of tiny JSON helper, error message wording, whether to use Fabric API helpers or vanilla calls for a given thing.
-- **Ask the user (Michael, michael.r.klear@gmail.com):** anything that changes scope, anything that requires Mojang account or dev-launcher steps the user has to perform, anything that fights the "minimum mod" framing, any sign that 2×2 inventory crafts are going to be more than a few hundred lines of Java. The user is treating v1 as a friction probe — surfacing real blockers fast is more valuable than burning a day on yak-shaving.
+- **Ask the user** anything that changes scope, anything that requires Mojang account or dev-launcher steps the user has to perform, anything that fights the "minimum mod" framing, any sign that 2×2 inventory crafts are going to be more than a few hundred lines of Java. The user is treating v1 as a friction probe — surfacing real blockers fast is more valuable than burning a day on yak-shaving.
 
 ## Counterpart: how `craft` will consume this
 

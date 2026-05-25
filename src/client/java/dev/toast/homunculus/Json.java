@@ -1,5 +1,11 @@
 package dev.toast.homunculus;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonPrimitive;
+
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -17,6 +23,38 @@ public final class Json {
 		StringBuilder sb = new StringBuilder();
 		writeValue(sb, value);
 		return sb.toString();
+	}
+
+	/** Convert our internal parsed JSON tree (Map/List/Boolean/Number/String/null) to a Gson JsonElement. */
+	public static JsonElement toJsonElement(Object value) {
+		if (value == null) return JsonNull.INSTANCE;
+		if (value instanceof Boolean b) return new JsonPrimitive(b);
+		if (value instanceof Number n) return new JsonPrimitive(n);
+		if (value instanceof String s) return new JsonPrimitive(s);
+		if (value instanceof Map<?, ?> m) {
+			JsonObject obj = new JsonObject();
+			for (Map.Entry<?, ?> e : m.entrySet()) {
+				obj.add(String.valueOf(e.getKey()), toJsonElement(e.getValue()));
+			}
+			return obj;
+		}
+		if (value instanceof List<?> list) {
+			JsonArray arr = new JsonArray();
+			for (Object item : list) arr.add(toJsonElement(item));
+			return arr;
+		}
+		throw new IllegalArgumentException("unsupported JSON value: " + value.getClass());
+	}
+
+	/** Short human label for the JSON shape (used in error messages). */
+	public static String typeLabel(Object value) {
+		if (value == null) return "null";
+		if (value instanceof Boolean) return "boolean";
+		if (value instanceof Number) return "number";
+		if (value instanceof String) return "string";
+		if (value instanceof Map<?, ?>) return "object";
+		if (value instanceof List<?>) return "array";
+		return value.getClass().getSimpleName();
 	}
 
 	public static Object parse(String input) {

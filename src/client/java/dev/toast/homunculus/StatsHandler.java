@@ -103,8 +103,14 @@ public final class StatsHandler implements HttpHandler {
 		// // 24000 = day count. Used by the agent harness to surface
 		// "minutes until nightfall" hints for survival prioritization.
 		long worldTime = p.level().getDayTime();
-		m.put("day_ticks", worldTime % 24000L);
+		long dayTicks = worldTime % 24000L;
+		m.put("day_ticks", dayTicks);
 		m.put("day_count", worldTime / 24000L);
+
+		m.put("is_sleeping", p.isSleeping());
+		boolean isThundering = p.level().isThundering();
+		m.put("is_thundering", isThundering);
+		m.put("is_night", (dayTicks >= 12541 && dayTicks <= 23458) || isThundering);
 
 		// Biome at the player's current block. Spawn biome is a strong
 		// confound for survival rollouts (forest = easy wood, desert = none,

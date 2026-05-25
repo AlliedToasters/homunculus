@@ -39,6 +39,8 @@ public final class HomunculusHttpServer {
 		server.createContext("/scan_nearest", new ScanNearestHandler());
 		server.createContext("/stats", new StatsHandler());
 		server.createContext("/craft", new CraftHandler());
+		server.createContext("/bed/place", new BedPlaceHandler());
+		server.createContext("/bed/sleep", new SleepHandler());
 		server.createContext("/place", new PlaceHandler());
 		server.createContext("/place_at", new PlaceAtHandler());
 		server.createContext("/equip", new EquipHandler());
@@ -65,6 +67,7 @@ public final class HomunculusHttpServer {
 		// no separate stub-handler dance like /baritone/* needs.
 		server.createContext("/wurst/hack", new WurstHackHandler());
 		server.createContext("/wurst/status", new WurstStatusHandler());
+		server.createContext("/wurst/setting", new WurstSettingHandler());
 		// /baritone/mine: BOM construction is prewarmed off the render thread to dodge the
 		// BlockOptionalMeta.drops() deadlock (see MineHandler.runMine). If this turns out to
 		// still hang, drop /baritone/mine from the route table and revert to xdotool #mine.
