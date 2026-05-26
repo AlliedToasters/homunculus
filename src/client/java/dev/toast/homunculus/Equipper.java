@@ -57,6 +57,11 @@ public final class Equipper {
 	private static final long PER_OP_TIMEOUT_MS = 2000;
 	private static final long CLICK_SETTLE_MS = 50;
 	private static final long FINAL_SETTLE_MS = 100;
+	// SWAP-click button index that swaps the clicked slot with the offhand
+	// (vanilla's "swap item with offhand" key). Hotbar swaps use 0-8; 40 is offhand.
+	private static final int OFFHAND_SWAP_BUTTON = 40;
+	// InventoryMenu slot id for the offhand (see stackAtMenuSlot's layout note).
+	private static final int OFFHAND_MENU_SLOT = 45;
 
 	public sealed interface Result permits Ok, Failure {}
 	public record Ok(Map<String, String> equipped, List<Change> changes, String message) implements Result {}
@@ -85,13 +90,18 @@ public final class Equipper {
 		applyHotbarRole(mc, "pickaxe",  2, Equipper::isPickaxe,  Equipper::compareTool,     changes);
 		applyHotbarRole(mc, "shovel",   3, Equipper::isShovel,   Equipper::compareTool,     changes);
 		applyHotbarRole(mc, "hoe",      4, Equipper::isHoe,      Equipper::compareTool,     changes);
-		applyHotbarRole(mc, "food",     5, Equipper::isFood,     Equipper::compareFood,     changes);
+		applyHotbarRole(mc, "food",     5, Equipper::isApprovedFood, Equipper::compareFood, changes);
 		applyHotbarRole(mc, "building", 6, Equipper::isBuilding, Equipper::compareBuilding, changes);
 
 		applyArmorRole(mc, EquipmentSlot.HEAD,  "head",  changes);
 		applyArmorRole(mc, EquipmentSlot.CHEST, "chest", changes);
 		applyArmorRole(mc, EquipmentSlot.LEGS,  "legs",  changes);
 		applyArmorRole(mc, EquipmentSlot.FEET,  "feet",  changes);
+
+		// Stage an approved food into the offhand for Wurst AutoEat (configured to
+		// eat from Hands/offhand only). This is what actually feeds the agent under
+		// that config; raw meat left in the hotbar/main inv is never auto-eaten.
+		curateOffhandFood(mc, changes);
 
 		Thread.sleep(FINAL_SETTLE_MS);
 		// Safety net: if anything left an item on the cursor, drop it back to inventory.
@@ -173,6 +183,80 @@ public final class Equipper {
 		}
 	}
 
+	/* ============================ Offhand food ============================ */
+
+	/**
+	 * Keep an {@link #isApprovedFood approved} food in the offhand so Wurst AutoEat
+	 * (Take items from = Hands + Allow offhand) has something to eat, and evict any
+	 * disallowed food (raw meat under COOKED_ONLY) that's sitting there.
+	 *
+	 * Offhand states:
+	 *   - approved food already present → leave it (no churn).
+	 *   - non-food item present → leave it (don't hijack the offhand, e.g. a shield).
+	 *   - empty / disallowed food → pull the best approved food from the inventory
+	 *     into the offhand; if none exists and the offhand holds disallowed food,
+	 *     evacuate it to a free inventory slot so AutoEat can't reach it.
+	 */
+	private static void curateOffhandFood(Minecraft mc, List<Change> changes) throws InterruptedException {
+		// 0 = approved food, 1 = empty, 2 = disallowed food, 3 = non-food.
+		int offState = supply(() -> {
+			LocalPlayer p = mc.player;
+			if (p == null) return 3;
+			ItemStack off = p.getInventory().offhand.get(0);
+			if (off.isEmpty()) return 1;
+			if (!off.has(DataComponents.FOOD)) return 3;
+			return isApprovedFood(off) ? 0 : 2;
+		});
+		if (offState == 0 || offState == 3) return;
+
+		// Best approved food anywhere in hotbar/main inv. Pass an impossible target
+		// (the offhand slot) so findBestSource never treats it as already-in-place.
+		int srcMenuSlot = supply(() ->
+				findBestSource(mc, Equipper::isApprovedFood, Equipper::compareFood, OFFHAND_MENU_SLOT));
+		String fromId = supply(() -> idAtMenuSlot(mc, OFFHAND_MENU_SLOT));
+
+		if (srcMenuSlot >= 0) {
+			supply(() -> {
+				mc.gameMode.handleInventoryMouseClick(
+						InventoryMenu.CONTAINER_ID, srcMenuSlot, OFFHAND_SWAP_BUTTON,
+						ClickType.SWAP, mc.player);
+				return null;
+			});
+			Thread.sleep(CLICK_SETTLE_MS);
+			String afterId = supply(() -> idAtMenuSlot(mc, OFFHAND_MENU_SLOT));
+			if (afterId != null && !afterId.equals(fromId)) {
+				changes.add(new Change("offhand_food", fromId, afterId));
+			}
+			return;
+		}
+
+		// No approved food available. If the offhand holds disallowed food, get it
+		// out of AutoEat's reach by swapping it into the first free inventory slot.
+		if (offState == 2) {
+			int emptyMenuSlot = supply(() -> firstEmptyInventoryMenuSlot(mc));
+			if (emptyMenuSlot >= 0) {
+				supply(() -> {
+					mc.gameMode.handleInventoryMouseClick(
+							InventoryMenu.CONTAINER_ID, emptyMenuSlot, OFFHAND_SWAP_BUTTON,
+							ClickType.SWAP, mc.player);
+					return null;
+				});
+				Thread.sleep(CLICK_SETTLE_MS);
+				changes.add(new Change("offhand_food", fromId, null));
+			}
+		}
+	}
+
+	/** First empty main-inv (9-35) then hotbar (0-8) slot, as a menu slot id; -1 if full. */
+	private static int firstEmptyInventoryMenuSlot(Minecraft mc) {
+		LocalPlayer p = mc.player;
+		if (p == null) return -1;
+		Inventory inv = p.getInventory();
+		for (int i = 9; i < 36; i++) if (inv.items.get(i).isEmpty()) return i;
+		for (int i = 0; i < 9; i++) if (inv.items.get(i).isEmpty()) return 36 + i;
+		return -1;
+	}
+
 	/* ============================ Search ============================ */
 
 	private static int findBestSource(
@@ -240,6 +324,14 @@ public final class Equipper {
 	private static boolean isShovel(ItemStack s)   { return s.getItem() instanceof ShovelItem; }
 	private static boolean isHoe(ItemStack s)      { return s.getItem() instanceof HoeItem; }
 	private static boolean isFood(ItemStack s)     { return s.has(DataComponents.FOOD); }
+	/** Food the current {@link FoodPolicy} permits auto-eating: any food under ANY,
+	 *  non-raw-meat food under COOKED_ONLY. Drives both the slot-5 food role and the
+	 *  offhand-food curator so raw meat is never staged where AutoEat can reach it. */
+	private static boolean isApprovedFood(ItemStack s) {
+		if (!s.has(DataComponents.FOOD)) return false;
+		if (FoodPolicy.get() == FoodPolicy.Mode.ANY) return true;
+		return !FoodPolicy.isRawMeat(itemPath(s.getItem()));
+	}
 	private static boolean isBuilding(ItemStack s) {
 		return BUILDING_BLOCK_TIER.containsKey(itemPath(s.getItem()));
 	}

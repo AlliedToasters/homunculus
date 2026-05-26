@@ -32,7 +32,7 @@ dependencies {
 	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 
 	// Baritone is runtime-only (loaded by user's mod manager); compile against the local jar.
-	modCompileOnly files('/home/toast/.local/share/PrismLauncher/instances/1.21.4/minecraft/mods/baritone-api-fabric-1.13.1.jar')
+	modCompileOnly files('/home/alliedtoasters/projects/mech_interp/gemmacraft/mods/baritone-api-fabric-1.13.1.jar')
 }
 
 processResources {

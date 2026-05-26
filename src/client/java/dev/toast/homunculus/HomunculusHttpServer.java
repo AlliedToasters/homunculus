@@ -44,6 +44,9 @@ public final class HomunculusHttpServer {
 		server.createContext("/place", new PlaceHandler());
 		server.createContext("/place_at", new PlaceAtHandler());
 		server.createContext("/equip", new EquipHandler());
+		// Food policy for the offhand-food curator (Equipper): ANY (daily-driver)
+		// vs COOKED_ONLY (cook-capability tests — raw meat never auto-eaten).
+		server.createContext("/food_policy", new FoodPolicyHandler());
 		server.createContext("/smelt", new SmeltHandler());
 		server.createContext("/smelt_status", new SmeltStatusHandler());
 		server.createContext("/collect_smelt", new CollectSmeltHandler());
