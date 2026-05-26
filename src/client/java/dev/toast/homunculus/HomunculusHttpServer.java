@@ -77,6 +77,7 @@ public final class HomunculusHttpServer {
 		if (Baritone.isApiLoaded()) {
 			server.createContext("/baritone/mine", new MineHandler());
 			server.createContext("/baritone/goto", new GotoHandler());
+			server.createContext("/baritone/follow", new FollowHandler());
 			server.createContext("/baritone/stop", new StopHandler());
 			server.createContext("/baritone/excavate", new ExcavateHandler());
 			server.createContext("/baritone/fill", new FillHandler());
@@ -86,6 +87,7 @@ public final class HomunculusHttpServer {
 			BaritoneStubHandler stub = new BaritoneStubHandler();
 			server.createContext("/baritone/mine", stub);
 			server.createContext("/baritone/goto", stub);
+			server.createContext("/baritone/follow", stub);
 			server.createContext("/baritone/stop", stub);
 			server.createContext("/baritone/excavate", stub);
 			server.createContext("/baritone/fill", stub);
