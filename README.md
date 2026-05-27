@@ -98,7 +98,7 @@ Bound to `127.0.0.1:25566` only (override with `-Dhomunculus.port=`). No auth; l
 
 | Method | Path | Body |
 |--------|------|------|
-| GET/POST | `/hud` | per-element map e.g. `{"health":false,"hotbar":false}`, or `{"all":false}`; vanilla HUD, visible by default |
+| GET/POST | `/hud` | per-element map e.g. `{"health":false,"hotbar":false}`, or `{"all":false}`; elements: `health`,`food`,`air`,`hotbar`,`effects`,`experience`,`crosshair`,`selected_item` (visible by default), `demo` (the "Demo time's up!" overlay, **hidden by default**) |
 | GET/POST | `/wurst/hud` | `{"visible":false}` (Wurst HUD — see above) |
 | GET/POST | `/baritone/render` | `{"visible":false}` (Baritone overlay — see above) |
 
@@ -128,7 +128,7 @@ A subtle implementation detail worth mentioning: `BlockOptionalMeta` (Baritone's
 
 **Reflexes (`/evasion`, `/water_aversion`).** Both follow an arm → (poll `/status`) → disarm lifecycle the Python harness drives once per turn. The watcher runs autonomously: on trigger (hostile hit / eye-submergence) it cancels any active Baritone task and flees — evasion back toward the armed anchor, water-aversion to a dry-land cell computed at fire time. Disarming does **not** cancel an in-progress flee.
 
-**Recording / overlays.** Three toggles suppress on-screen overlays so headless captures stay clean (these agents are recorded for manual review): `/hud` controls vanilla Minecraft HUD elements per-element (or `{"all":false}`), `/wurst/hud` hides Wurst's logo/hacklist/TabGui, `/baritone/render` hides Baritone's path/goal/selection visuals. Defaults reflect intent — Wurst's HUD is pure clutter so it defaults **hidden**; the vanilla HUD and Baritone overlay are useful, so they default **visible** and are merely made toggleable. All are implemented as flag-gated render-cancel mixins.
+**Recording / overlays.** Three toggles suppress on-screen overlays so headless captures stay clean (these agents are recorded for manual review): `/hud` controls vanilla Minecraft HUD elements per-element (or `{"all":false}`), `/wurst/hud` hides Wurst's logo/hacklist/TabGui, `/baritone/render` hides Baritone's path/goal/selection visuals. Defaults reflect intent — pure clutter defaults **hidden** (Wurst's HUD; the vanilla `demo` "Demo time's up!" overlay, which the offline-mode fleet always shows since 20+ concurrent clients can't share the handful of owned accounts); genuinely useful overlays default **visible** and are merely made toggleable (the rest of the vanilla HUD, Baritone's overlay). All are implemented as flag-gated render-cancel mixins.
 
 See `SPEC.md` for full request/response schemas including all failure reasons and structured-error fields.
 

@@ -19,11 +19,13 @@ import java.util.Map;
  *             elements are left unchanged. Returns the full visibility map.
  *
  * <p>Toggles vanilla in-game HUD elements (health, food, air, hotbar, effects,
- * experience, crosshair, selected-item name) by cancelling their render in
+ * experience, crosshair, selected-item name, demo) by cancelling their render in
  * {@code GuiHudMixin}. State is plain in-memory flags ({@link HudState}) read on
  * the render thread, so — unlike the other state-touching handlers — no
- * client-thread hop is needed. All elements default to visible; this is opt-in
- * suppression for clean recordings (see [[project-agent-video-recording]]).
+ * client-thread hop is needed. Most elements default to visible (opt-in
+ * suppression for clean recordings); {@code demo} (the "Demo time's up!" overlay)
+ * defaults hidden since the offline-mode fleet always runs in demo mode. See
+ * [[project-agent-video-recording]].
  */
 public final class HudHandler implements HttpHandler {
     private static final int MAX_BODY_BYTES = 1024;

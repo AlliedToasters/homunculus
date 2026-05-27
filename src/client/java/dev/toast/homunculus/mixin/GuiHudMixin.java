@@ -60,4 +60,9 @@ public class GuiHudMixin {
     private void homunculus$selectedItem(CallbackInfo ci) {
         if (HudState.isHidden(Element.SELECTED_ITEM)) ci.cancel();
     }
+
+    @Inject(method = "renderDemoOverlay", at = @At("HEAD"), cancellable = true)
+    private void homunculus$demo(CallbackInfo ci) {
+        if (HudState.isHidden(Element.DEMO)) ci.cancel();
+    }
 }

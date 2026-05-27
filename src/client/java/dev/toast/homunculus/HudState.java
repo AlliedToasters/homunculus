@@ -16,19 +16,27 @@ public final class HudState {
 
     /** A toggleable vanilla HUD element, with the JSON key used by /hud. */
     public enum Element {
-        HEALTH("health"),
-        FOOD("food"),
-        AIR("air"),
-        HOTBAR("hotbar"),
-        EFFECTS("effects"),
-        EXPERIENCE("experience"),
-        CROSSHAIR("crosshair"),
-        SELECTED_ITEM("selected_item");
+        HEALTH("health", false),
+        FOOD("food", false),
+        AIR("air", false),
+        HOTBAR("hotbar", false),
+        EFFECTS("effects", false),
+        EXPERIENCE("experience", false),
+        CROSSHAIR("crosshair", false),
+        SELECTED_ITEM("selected_item", false),
+        // The "Demo time's up!" overlay (Gui.renderDemoOverlay), shown whenever the
+        // client runs in demo mode — which the agent fleet always does, since 20+
+        // concurrent clients can't share the handful of owned accounts. Pure noise
+        // for us, so it defaults hidden. No-op on owned-account clients (renders
+        // only when Minecraft.isDemo()).
+        DEMO("demo", true);
 
         public final String key;
+        public final boolean defaultHidden;
 
-        Element(String key) {
+        Element(String key, boolean defaultHidden) {
             this.key = key;
+            this.defaultHidden = defaultHidden;
         }
     }
 
@@ -37,7 +45,7 @@ public final class HudState {
     private static final EnumMap<Element, AtomicBoolean> HIDDEN = new EnumMap<>(Element.class);
     static {
         for (Element e : Element.values()) {
-            HIDDEN.put(e, new AtomicBoolean(false));
+            HIDDEN.put(e, new AtomicBoolean(e.defaultHidden));
         }
     }
 
