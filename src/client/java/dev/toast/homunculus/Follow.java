@@ -4,10 +4,14 @@ import baritone.api.BaritoneAPI;
 import baritone.api.IBaritone;
 import baritone.api.process.IFollowProcess;
 import net.minecraft.client.Minecraft;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.phys.AABB;
 
+import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
@@ -34,7 +38,11 @@ public final class Follow {
     public static final long HARD_CAP_SECONDS = 60;
     private static final long GAME_THREAD_TIMEOUT_MS = 5_000;
     private static final long POLL_MS = 400;
-    private static final int EMPTY_POLLS_TO_STOP = 4; // ~1.6s with nothing to follow → done
+    private static final int EMPTY_POLLS_TO_STOP = 4; // ~1.6s with nothing to do → done
+    // Horizontal+vertical reach for the "is there still prey to hunt?" scan that drives the
+    // early-stop. Generous so the window stays open while a reachable mob is anywhere in the
+    // engagement area (KillAura needs the player loitering for several seconds to land a kill).
+    private static final double PREY_SCAN_RADIUS = 24.0;
 
     public record Result(boolean ok, String reason, String message) {}
 
@@ -55,22 +63,38 @@ public final class Follow {
 
     private static Result runLocked(Set<EntityType<?>> followTypes, boolean pickup,
                                     long durationSeconds, int followRadius) {
-        // Follow prey of the requested types; when picking up, also follow loose ItemEntities so
-        // Baritone walks onto drops (and following() reflects them, keeping the early-stop honest).
-        Predicate<Entity> followPredicate = e ->
-                followTypes.contains(e.getType()) || (pickup && e instanceof ItemEntity);
-
         Integer priorRadius;
         try {
             priorRadius = ClientThread.supply(() -> {
                 IBaritone bar = BaritoneAPI.getProvider().getPrimaryBaritone();
                 if (bar == null) throw new IllegalStateException("no primary Baritone (player not in world?)");
                 if (Minecraft.getInstance().player == null) throw new IllegalStateException("no player");
+
+                // Items Wurst AutoDrop will reflexively re-drop. Excluding them from
+                // pickup is load-bearing: without it, Baritone paths onto an autodropped
+                // item → AutoDrop drops it next tick → it re-paths to the same item =
+                // infinite loop (observed agent4 oscillating sapling↔feather). Single
+                // source of truth: the same AutoDrop "Items" list the agent seeds at
+                // startup, read live. Best-effort — empty set (pick up anything) if Wurst
+                // or AutoDrop is unavailable, preserving prior behavior.
+                Set<String> autodropIds = pickup ? readAutoDropItems() : Set.of();
+
+                // Follow prey of the requested types; when picking up, also follow loose
+                // ItemEntities (so Baritone walks onto drops and following() reflects them,
+                // keeping the early-stop honest) — but never an item AutoDrop will re-drop.
+                Predicate<Entity> followPredicate = e -> {
+                    if (followTypes.contains(e.getType())) return true;
+                    if (pickup && e instanceof ItemEntity ie) {
+                        return !autodropIds.contains(itemId(ie.getItem()));
+                    }
+                    return false;
+                };
+
                 Integer prev = BaritoneAPI.getSettings().followRadius.value;
                 BaritoneAPI.getSettings().followRadius.value = followRadius;
                 IFollowProcess fp = bar.getFollowProcess();
                 fp.follow(followPredicate);
-                if (pickup) fp.pickup(stack -> true);
+                if (pickup) fp.pickup(stack -> !autodropIds.contains(itemId(stack)));
                 return prev;
             }).get(GAME_THREAD_TIMEOUT_MS, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
@@ -84,16 +108,23 @@ public final class Follow {
         try {
             while (System.currentTimeMillis() < deadline) {
                 Thread.sleep(POLL_MS);
-                int following;
+                // Keep the window open while there's still something to do: prey nearby (a fresh
+                // scan — NOT following(), which the old code leaned on and which a kill-stalled or
+                // out-of-Baritone-range mob doesn't reliably populate) OR kept-item drops still
+                // being followed for pickup. The window staying open is what gives KillAura time to
+                // land the kill; basing it on following() alone collapsed to a ~1.6s early-stop once
+                // junk ItemEntities were excluded, so KillAura never engaged.
+                int activity;
                 try {
-                    following = ClientThread.supply(() -> {
+                    activity = ClientThread.supply(() -> {
                         IBaritone bar = BaritoneAPI.getProvider().getPrimaryBaritone();
-                        return bar == null ? 0 : bar.getFollowProcess().following().size();
+                        int following = bar == null ? 0 : bar.getFollowProcess().following().size();
+                        return following + countNearbyPrey(followTypes, PREY_SCAN_RADIUS);
                     }).get(GAME_THREAD_TIMEOUT_MS, TimeUnit.MILLISECONDS);
                 } catch (Exception e) {
-                    following = 0;
+                    activity = 0;
                 }
-                if (following == 0) {
+                if (activity == 0) {
                     if (++emptyPolls >= EMPTY_POLLS_TO_STOP) { reason = "targets_cleared"; break; }
                 } else {
                     emptyPolls = 0;
@@ -119,6 +150,39 @@ public final class Follow {
             }
         }
         return new Result(true, reason, "follow ran (" + reason + ")");
+    }
+
+    private static String itemId(ItemStack stack) {
+        return BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+    }
+
+    /** Count prey entities of {@code preyTypes} within {@code radius} of the player. Client-thread only. */
+    private static int countNearbyPrey(Set<EntityType<?>> preyTypes, double radius) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null) return 0;
+        AABB box = mc.player.getBoundingBox().inflate(radius);
+        return mc.level.getEntities(mc.player, box, e -> preyTypes.contains(e.getType())).size();
+    }
+
+    /**
+     * The live Wurst AutoDrop "Items" list (ids AutoDrop will re-drop), or an empty set if Wurst /
+     * AutoDrop / the setting reflection isn't available. Must be called on the client thread.
+     */
+    private static Set<String> readAutoDropItems() {
+        try {
+            if (!Wurst.isApiLoaded() || !Wurst.isSettingApiReady()) return Set.of();
+            Object hack = Wurst.findHack("AutoDrop");
+            if (hack == null) return Set.of();
+            Object setting = Wurst.findSetting(hack, "Items");
+            if (setting == null || !Wurst.isItemListSetting(setting)) return Set.of();
+            Set<String> ids = new HashSet<>(Wurst.getItemNames(setting));
+            HomunculusClient.LOGGER.info("Follow: excluding {} AutoDrop item(s) from pickup", ids.size());
+            return ids;
+        } catch (Exception e) {
+            HomunculusClient.LOGGER.warn("Follow: could not read AutoDrop list ({}); pickup unfiltered",
+                    rootMessage(e));
+            return Set.of();
+        }
     }
 
     private static void cancelQuietly() {
