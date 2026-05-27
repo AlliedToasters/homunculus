@@ -5,18 +5,14 @@ import com.sun.net.httpserver.HttpHandler;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
-import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
-import net.minecraft.world.entity.LivingEntity;
-import net.minecraft.world.phys.AABB;
 
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -110,38 +106,15 @@ public final class ScanEntitiesHandler implements HttpHandler {
 					"entity type '" + typeStr + "' is not registered");
 		}
 		EntityType<?> target = resolved.get();
-		String resolvedId = BuiltInRegistries.ENTITY_TYPE.getKey(target).toString();
 
-		AABB box = new AABB(
-				p.getX() - radius, p.getY() - radius, p.getZ() - radius,
-				p.getX() + radius, p.getY() + radius, p.getZ() + radius);
-
-		List<Entity> matched = level.getEntities(p, box, e -> e.getType() == target);
+		// Nearest-first via the shared entity-resolution highway, then snapshot to the
+		// long-standing /scan_entities record shape and apply the result cap.
+		List<Entity> matched = Entities.query(p, level, radius, e -> e.getType() == target);
 
 		List<Map<String, Object>> records = new ArrayList<>(matched.size());
 		for (Entity e : matched) {
-			Map<String, Object> rec = new LinkedHashMap<>();
-			rec.put("type", resolvedId);
-			rec.put("uuid", e.getUUID().toString());
-			List<Object> pos = new ArrayList<>(3);
-			pos.add(e.getX());
-			pos.add(e.getY());
-			pos.add(e.getZ());
-			rec.put("position", pos);
-			rec.put("distance", p.distanceTo(e));
-			if (e instanceof LivingEntity le) {
-				rec.put("is_baby", le.isBaby());
-				rec.put("health", le.getHealth());
-			} else {
-				rec.put("is_baby", false);
-				rec.put("health", null);
-			}
-			records.add(rec);
-		}
-
-		records.sort(Comparator.comparingDouble(r -> ((Number) r.get("distance")).doubleValue()));
-		if (records.size() > limit) {
-			records = new ArrayList<>(records.subList(0, limit));
+			if (records.size() >= limit) break;
+			records.add(Entities.snapshot(p, e).toJson());
 		}
 
 		Map<String, Object> result = new LinkedHashMap<>();

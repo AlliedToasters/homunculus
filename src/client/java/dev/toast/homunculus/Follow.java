@@ -4,16 +4,13 @@ import baritone.api.BaritoneAPI;
 import baritone.api.IBaritone;
 import baritone.api.process.IFollowProcess;
 import net.minecraft.client.Minecraft;
-import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
-import net.minecraft.world.entity.item.ItemEntity;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.phys.AABB;
 
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
 
 /**
@@ -22,10 +19,16 @@ import java.util.function.Predicate;
  * <p>The old hunt path ({@code handle_hunt_passive}) sent Baritone to the mob's last-known block
  * with a single {@code GoalBlock} and waited; a fleeing mob escaped before the agent's next ~0.5s
  * LLM turn, so KillAura rarely landed the kill. FollowProcess continuously re-paths to the nearest
- * matching entity, so KillAura keeps closing into melee with no LLM turn in the loop. With
- * {@code pickup} enabled, the follow predicate also matches {@link ItemEntity} drops (Baritone paths
- * onto them → vanilla pickup) and the process's own item-pickup predicate is set — fixing the poor
- * drop-collection rate.
+ * matching entity, so KillAura keeps closing into melee with no LLM turn in the loop.
+ *
+ * <p><b>Phased follow.</b> FollowProcess pursues the single <i>nearest</i> entity its predicate
+ * accepts — it can't be told to prefer one kind over another. So the predicate is phased: while any
+ * live prey is in range it accepts prey only; once prey clears it switches to accepting loose item
+ * drops (the post-hunt sweep). A flat "prey OR items" predicate let a ground drop nearer than the
+ * mob win the nearest-target race, parking the player on the item while KillAura never reached a
+ * mob (observed: failed hunts moved ~4 blocks vs ~39 on a successful chase). Vanilla ~1-block
+ * auto-pickup still grabs drops trampled during the chase, so deferring the deliberate item-sweep
+ * until prey clears costs ~nothing. Entity scans go through {@link Entities}.
  *
  * <p>Acquires {@link Baritone#SESSION_LOCK} (returns {@code busy} if another /baritone/* call holds
  * it). Snapshots+restores {@code followRadius}. Cancels FollowProcess + pathing on exit via
@@ -63,12 +66,19 @@ public final class Follow {
 
     private static Result runLocked(Set<EntityType<?>> followTypes, boolean pickup,
                                     long durationSeconds, int followRadius) {
+        // Live phase flag, flipped by the poll loop. false = hunt prey (ignore items); true =
+        // sweep drops (no live prey left). Read inside the FollowProcess predicate, which Baritone
+        // re-evaluates every tick on the client thread, so a flip takes effect within one poll.
+        final AtomicBoolean sweepItems = new AtomicBoolean(false);
+        final Predicate<Entity> preyPred = Entities.ofTypes(followTypes);
+
         Integer priorRadius;
         try {
             priorRadius = ClientThread.supply(() -> {
                 IBaritone bar = BaritoneAPI.getProvider().getPrimaryBaritone();
                 if (bar == null) throw new IllegalStateException("no primary Baritone (player not in world?)");
-                if (Minecraft.getInstance().player == null) throw new IllegalStateException("no player");
+                Minecraft mc = Minecraft.getInstance();
+                if (mc.player == null || mc.level == null) throw new IllegalStateException("no player");
 
                 // Items Wurst AutoDrop will reflexively re-drop. Excluding them from
                 // pickup is load-bearing: without it, Baritone paths onto an autodropped
@@ -79,22 +89,23 @@ public final class Follow {
                 // or AutoDrop is unavailable, preserving prior behavior.
                 Set<String> autodropIds = pickup ? readAutoDropItems() : Set.of();
 
-                // Follow prey of the requested types; when picking up, also follow loose
-                // ItemEntities (so Baritone walks onto drops and following() reflects them,
-                // keeping the early-stop honest) — but never an item AutoDrop will re-drop.
-                Predicate<Entity> followPredicate = e -> {
-                    if (followTypes.contains(e.getType())) return true;
-                    if (pickup && e instanceof ItemEntity ie) {
-                        return !autodropIds.contains(itemId(ie.getItem()));
-                    }
-                    return false;
-                };
+                // Phased predicate (see class doc): prey always matches; loose item drops match
+                // only once sweepItems flips true (no live prey left), so a stray drop never
+                // out-competes a mob for FollowProcess's nearest-target pick.
+                Predicate<Entity> itemPred = pickup ? Entities.looseItems(autodropIds) : e -> false;
+                Predicate<Entity> followPredicate =
+                        e -> preyPred.test(e) || (sweepItems.get() && itemPred.test(e));
+
+                // Seed the phase: if there's no prey to hunt right now (pure-gather call, or the
+                // herd already moved off), go straight to sweep so we still act on drops.
+                sweepItems.set(pickup
+                        && Entities.count(mc.player, mc.level, PREY_SCAN_RADIUS, preyPred) == 0);
 
                 Integer prev = BaritoneAPI.getSettings().followRadius.value;
                 BaritoneAPI.getSettings().followRadius.value = followRadius;
                 IFollowProcess fp = bar.getFollowProcess();
                 fp.follow(followPredicate);
-                if (pickup) fp.pickup(stack -> !autodropIds.contains(itemId(stack)));
+                if (pickup) fp.pickup(stack -> !autodropIds.contains(Entities.itemId(stack)));
                 return prev;
             }).get(GAME_THREAD_TIMEOUT_MS, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
@@ -109,17 +120,20 @@ public final class Follow {
             while (System.currentTimeMillis() < deadline) {
                 Thread.sleep(POLL_MS);
                 // Keep the window open while there's still something to do: prey nearby (a fresh
-                // scan — NOT following(), which the old code leaned on and which a kill-stalled or
-                // out-of-Baritone-range mob doesn't reliably populate) OR kept-item drops still
-                // being followed for pickup. The window staying open is what gives KillAura time to
-                // land the kill; basing it on following() alone collapsed to a ~1.6s early-stop once
-                // junk ItemEntities were excluded, so KillAura never engaged.
+                // scan — NOT following(), which a kill-stalled or out-of-Baritone-range mob doesn't
+                // reliably populate) OR kept-item drops still being followed during the sweep phase.
+                // The window staying open is what gives KillAura time to land the kill.
                 int activity;
                 try {
                     activity = ClientThread.supply(() -> {
                         IBaritone bar = BaritoneAPI.getProvider().getPrimaryBaritone();
                         int following = bar == null ? 0 : bar.getFollowProcess().following().size();
-                        return following + countNearbyPrey(followTypes, PREY_SCAN_RADIUS);
+                        Minecraft mc = Minecraft.getInstance();
+                        int prey = (mc.player == null || mc.level == null) ? 0
+                                : Entities.count(mc.player, mc.level, PREY_SCAN_RADIUS, preyPred);
+                        // Phase transition: hunt while any prey remains; once cleared, sweep drops.
+                        if (pickup) sweepItems.set(prey == 0);
+                        return following + prey;
                     }).get(GAME_THREAD_TIMEOUT_MS, TimeUnit.MILLISECONDS);
                 } catch (Exception e) {
                     activity = 0;
@@ -150,18 +164,6 @@ public final class Follow {
             }
         }
         return new Result(true, reason, "follow ran (" + reason + ")");
-    }
-
-    private static String itemId(ItemStack stack) {
-        return BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
-    }
-
-    /** Count prey entities of {@code preyTypes} within {@code radius} of the player. Client-thread only. */
-    private static int countNearbyPrey(Set<EntityType<?>> preyTypes, double radius) {
-        Minecraft mc = Minecraft.getInstance();
-        if (mc.player == null || mc.level == null) return 0;
-        AABB box = mc.player.getBoundingBox().inflate(radius);
-        return mc.level.getEntities(mc.player, box, e -> preyTypes.contains(e.getType())).size();
     }
 
     /**

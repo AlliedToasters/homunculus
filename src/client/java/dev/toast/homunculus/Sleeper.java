@@ -6,10 +6,8 @@ import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.InteractionHand;
-import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.level.block.BedBlock;
-import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 
@@ -118,15 +116,11 @@ public final class Sleeper {
                 "cannot sleep during day (day_ticks=" + dayTicks + ", thundering=" + isThundering + ")"));
         }
 
-        // Match MC's Player.startSleepInBed monster check geometry: player-centered AABB,
-        // ±8 horizontal, ±5 vertical. We can't apply MC's isPreventingPlayerRest filter
-        // (server-side only API) so we include all hostile mobs — false positives at worst.
-        Vec3 playerPos = p.position();
-        AABB searchBox = new AABB(
-            playerPos.x - 8, playerPos.y - 5, playerPos.z - 8,
-            playerPos.x + 8, playerPos.y + 5, playerPos.z + 8);
-        boolean hasMonsters = !level.getEntitiesOfClass(Monster.class, searchBox, e -> true).isEmpty();
-        if (hasMonsters) {
+        // Match MC's Player.startSleepInBed monster check: player-centered ±8 horizontal / ±5
+        // vertical box, hostility by Monster.class (Entities.isMonsterClass — the same definition
+        // vanilla uses here). We can't apply MC's server-side isPreventingPlayerRest filter, so we
+        // include all such mobs — false positives at worst.
+        if (Entities.count(p, level, 8, 5, Entities::isMonsterClass) > 0) {
             return SleepCheck.fail(new Failure("monsters_nearby",
                 "hostile mob(s) within 8 blocks horizontally / 5 vertically"));
         }
@@ -172,12 +166,7 @@ public final class Sleeper {
             return new Failure("not_night", "it is not night (day_ticks=" + dayTicks + ")");
         }
 
-        Vec3 playerPos = p.position();
-        AABB box = new AABB(
-            playerPos.x - 8, playerPos.y - 5, playerPos.z - 8,
-            playerPos.x + 8, playerPos.y + 5, playerPos.z + 8);
-        boolean hasMonsters = !level.getEntitiesOfClass(Monster.class, box, e -> true).isEmpty();
-        if (hasMonsters) {
+        if (Entities.count(p, level, 8, 5, Entities::isMonsterClass) > 0) {
             return new Failure("monsters_nearby", "hostile mob(s) within 8 blocks horizontally / 5 vertically");
         }
 

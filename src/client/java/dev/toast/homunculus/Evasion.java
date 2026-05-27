@@ -9,7 +9,6 @@ import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.MobCategory;
 import net.minecraft.world.entity.player.Player;
 
 import java.util.LinkedHashSet;
@@ -217,8 +216,7 @@ public final class Evasion {
         Entity attacker = src.getEntity();
         if (attacker == null) return false;
         if (attacker instanceof Player) return false;  // ignore PvP for evasion purposes
-        MobCategory cat = attacker.getType().getCategory();
-        return cat == MobCategory.MONSTER;
+        return Entities.isHostileCategory(attacker);
     }
 
     private static String describeAttacker(DamageSource src) {
