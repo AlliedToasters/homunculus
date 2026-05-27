@@ -71,6 +71,14 @@ public final class HomunculusHttpServer {
 		server.createContext("/wurst/hack", new WurstHackHandler());
 		server.createContext("/wurst/status", new WurstStatusHandler());
 		server.createContext("/wurst/setting", new WurstSettingHandler());
+		// /wurst/hud toggles Wurst's on-screen HUD (logo, hack list, TabGui) via
+		// the WurstIngameHudMixin render-cancel. Hidden by default for clean
+		// headless recordings; POST {"visible": true} to restore.
+		server.createContext("/wurst/hud", new WurstHudHandler());
+		// /hud toggles vanilla in-game HUD elements (health, food, air, hotbar,
+		// effects, xp, crosshair, selected-item) via GuiHudMixin render-cancels.
+		// All visible by default; POST a per-element map (or {"all": false}) to hide.
+		server.createContext("/hud", new HudHandler());
 		// /baritone/mine: BOM construction is prewarmed off the render thread to dodge the
 		// BlockOptionalMeta.drops() deadlock (see MineHandler.runMine). If this turns out to
 		// still hang, drop /baritone/mine from the route table and revert to xdotool #mine.
@@ -83,6 +91,7 @@ public final class HomunculusHttpServer {
 			server.createContext("/baritone/fill", new FillHandler());
 			server.createContext("/baritone/throwaway_items", new ThrowawayItemsHandler());
 			server.createContext("/baritone/allow_break", new AllowBreakHandler());
+			server.createContext("/baritone/render", new BaritoneRenderHandler());
 		} else {
 			BaritoneStubHandler stub = new BaritoneStubHandler();
 			server.createContext("/baritone/mine", stub);
@@ -93,6 +102,7 @@ public final class HomunculusHttpServer {
 			server.createContext("/baritone/fill", stub);
 			server.createContext("/baritone/throwaway_items", stub);
 			server.createContext("/baritone/allow_break", stub);
+			server.createContext("/baritone/render", stub);
 			HomunculusClient.LOGGER.warn("Baritone API not on classpath — /baritone/* will return baritone_not_loaded");
 		}
 		server.createContext("/", exchange -> {

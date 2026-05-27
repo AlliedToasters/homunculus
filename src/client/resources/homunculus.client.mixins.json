@@ -1,0 +1,14 @@
+{
+	"required": true,
+	"minVersion": "0.8",
+	"package": "dev.toast.homunculus.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"plugin": "dev.toast.homunculus.mixin.HomunculusMixinPlugin",
+	"client": [
+		"WurstIngameHudMixin",
+		"GuiHudMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}
