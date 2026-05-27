@@ -19,22 +19,88 @@ See [`CLAUDE.md`](./CLAUDE.md) for scope/decisions and [`SPEC.md`](./SPEC.md) fo
 
 ## HTTP API
 
-Bound to `127.0.0.1:25566` only. No auth; localhost bind is the boundary. All endpoints are synchronous (block until completion or 5s timeout).
+Bound to `127.0.0.1:25566` only (override with `-Dhomunculus.port=`). No auth; localhost bind is the boundary. Calls are synchronous — they block until the operation completes or times out. Most return within a few seconds; long-running Baritone ops take an explicit `timeout_seconds`. All responses are JSON; failures carry `{"success": false, "reason": ..., "message": ...}`. This table is the full surface; the route table lives in `HomunculusHttpServer.java` and each handler's class javadoc documents its exact shape.
 
-| Method | Path        | Body                                                  |
-|--------|-------------|-------------------------------------------------------|
-| GET    | `/inventory` | —                                                    |
-| GET    | `/position`  | —                                                    |
-| GET    | `/scan_column` | query: optional `x`, `z` (block coords)            |
-| POST   | `/craft`     | `{"item": "minecraft:wooden_pickaxe", "count": 1}`   |
-| POST   | `/place`     | `{"item": "minecraft:crafting_table"}`               |
-| POST   | `/equip`     | —                                                    |
-| POST   | `/smelt`     | `{"input": "minecraft:raw_iron", "count": 1}` (optional `"fuel": "minecraft:coal"`) |
-| POST   | `/baritone/mine` | `{"block": "oak_log", "count": 4, "timeout_seconds": 45}` |
-| POST   | `/baritone/goto` | `{"x": 12, "y": 64, "z": -7, "timeout_seconds": 60, "arrival_tolerance": 2}` |
-| POST   | `/baritone/excavate` | `{"x1": 12, "y1": 62, "z1": -7, "x2": 15, "y2": 64, "z2": -4, "timeout_seconds": 120}` |
-| POST   | `/baritone/fill` | `{"block": "cobblestone", "x1": 12, "y1": 62, "z1": -7, "x2": 15, "y2": 62, "z2": -4}` |
-| POST   | `/baritone/stop` | —                                                |
+**Perception & state** (read-only)
+
+| Method | Path | Query | Returns |
+|--------|------|-------|---------|
+| GET | `/inventory` | — | `main[]`, `armor` (head/chest/legs/feet), `offhand`, `selected_slot`; items `{slot,id,count}` |
+| GET | `/position` | — | `{x,y,z,yaw,pitch}` (doubles) |
+| GET | `/stats` | — | vitals (`health`,`food`,`saturation`,`air`,`max_*`), `effects[]`, `experience`, `biome`/`dimension`/`gamemode`, `is_night`/`is_thundering`/`day_count`, `on_fire`/`on_ground`/`in_water`/`in_lava`/`is_sleeping` |
+| GET | `/scan_column` | `x?`,`z?` | `surface_y` for a column (player's column if omitted) |
+| GET | `/scan_blocks` | `x1,y1,z1,x2,y2,z2` | every block in the AABB (`id`,`passable`,position); volume-capped |
+| GET | `/scan_entities` | `type` (req), `radius?`, `limit?` | nearby entities (`type`,`position`,`distance`,`health`,`is_baby`,`uuid`) |
+| GET | `/scan_nearest` | `ids` (req, comma-sep), `radius?`, `y_radius?` | nearest matching blocks to the player |
+| GET | `/deaths` | `since?` (ms epoch) | death-log entries since the timestamp |
+| GET | `/debug/door_courtesy` | — | debug snapshot of the close-door-behind-you behavior |
+
+**Crafting & inventory actions**
+
+| Method | Path | Body |
+|--------|------|------|
+| POST | `/craft` | `{"item":"minecraft:wooden_pickaxe","count":1}` (2×2 + 3×3) |
+| POST | `/place` | `{"item":"minecraft:crafting_table"}` (mod auto-picks the spot) |
+| POST | `/place_at` | `{"item":"minecraft:oak_door","x":10,"y":64,"z":-3}` (exact cell) |
+| POST | `/equip` | — (auto-organizes hotbar 0–6 + armor) |
+| GET/POST | `/food_policy` | `{"mode":"any"\|"cooked_only"}` |
+
+**Smelting**
+
+| Method | Path | Body |
+|--------|------|------|
+| POST | `/smelt` | `{"input":"minecraft:raw_iron","count":1}` (optional `"fuel":"minecraft:coal"`) |
+| GET | `/smelt_status` | — (active smelts in `smelts[]`) |
+| POST | `/collect_smelt` | `{"furnace_pos":{...}}` (optional; routes to a registered furnace + withdraws output) |
+
+**Sleep**
+
+| Method | Path | Body |
+|--------|------|------|
+| POST | `/bed/place` | `{"item":"minecraft:red_bed"}` (optional; any `*_bed` if omitted) |
+| POST | `/bed/sleep` | `{"max_radius":6}` (optional; returns immediately — poll `/stats` `is_sleeping`) |
+
+**Baritone** — require the Baritone API at runtime; absent → `{success:false, reason:"baritone_not_loaded"}`
+
+| Method | Path | Body |
+|--------|------|------|
+| POST | `/baritone/mine` | `{"block":"oak_log","count":4,"timeout_seconds":45}` (`count` = cumulative inventory target) |
+| POST | `/baritone/goto` | `{"x":12,"y":64,"z":-7,"goal_type":"block"\|"y_level","timeout_seconds":60,"arrival_tolerance":2,"allow_place":false,"throwaway_items":[...],"ensure_throwaway_in_hotbar":false}` |
+| POST | `/baritone/follow` | `{"follow_types":["cow","pig"],"pickup":true,"duration_seconds":12,"follow_radius":2}` |
+| POST | `/baritone/excavate` | `{"x1":12,"y1":62,"z1":-7,"x2":15,"y2":64,"z2":-4,"timeout_seconds":120}` (≤500 vol) |
+| POST | `/baritone/fill` | `{"block":"cobblestone","x1":12,"y1":62,"z1":-7,"x2":15,"y2":62,"z2":-4}` (block must be in hotbar) |
+| POST | `/baritone/stop` | — (cancels the in-flight task; bypasses the session lock) |
+| GET/POST | `/baritone/throwaway_items` | `{"items":["minecraft:diorite",...]}` (`acceptableThrowawayItems` setting) |
+| GET/POST | `/baritone/allow_break` | `{"value":true}` (`allowBreak` setting) |
+| GET/POST | `/baritone/render` | `{"visible":false}` (path/goal/selection overlay; visible by default) |
+
+**Reflexes** — arm once per turn, optionally poll `/status`, disarm at end; the watcher cancels Baritone and flees autonomously on trigger
+
+| Method | Path | Body |
+|--------|------|------|
+| POST | `/evasion/arm` | `{"x":..,"y":..,"z":..}` (anchor to flee back toward on hostile hit) |
+| POST | `/evasion/disarm` | — (does not cancel an in-progress flee) |
+| GET | `/evasion/status` | — (`armed`,`fired`,`anchor`,`attackers`,`flee_state`,…) |
+| POST | `/water_aversion/arm` | — (no body; dry-land target computed at fire time) |
+| POST | `/water_aversion/disarm` | — |
+| GET | `/water_aversion/status` | — (`armed`,`fired`,`submerged_pos`,`dry_land_pos`,…) |
+
+**Wurst bridge** — reflection-only; require the Wurst mod at runtime; absent → `{success:false, reason:"wurst_not_loaded"}`
+
+| Method | Path | Body / query |
+|--------|------|--------------|
+| POST | `/wurst/hack` | `{"name":"KillAura","enabled":true}` |
+| GET | `/wurst/status` | — (lists all hacks: `name`,`enabled`,`category`) |
+| GET/POST | `/wurst/setting` | GET query `hack`,`setting`; POST `{"hack":...,"setting":...,"value":<json>,"op":"replace\|add\|remove\|reset"}` |
+| GET/POST | `/wurst/hud` | `{"visible":false}` (Wurst logo/hacklist/TabGui; **hidden by default**) |
+
+**Recording / overlay control** — suppress on-screen overlays for clean video capture (see the overlay notes below)
+
+| Method | Path | Body |
+|--------|------|------|
+| GET/POST | `/hud` | per-element map e.g. `{"health":false,"hotbar":false}`, or `{"all":false}`; vanilla HUD, visible by default |
+| GET/POST | `/wurst/hud` | `{"visible":false}` (Wurst HUD — see above) |
+| GET/POST | `/baritone/render` | `{"visible":false}` (Baritone overlay — see above) |
 
 `/position` returns the player's world-space `{x, y, z, yaw, pitch}` as doubles (Mojang conventions: yaw 0 = facing +Z, pitch 0 = horizontal). For perception and goto math.
 
@@ -48,11 +114,21 @@ Bound to `127.0.0.1:25566` only. No auth; localhost bind is the boundary. All en
 
 `/smelt` runs `count` smelts of `input` against a placed furnace within 4 blocks. Pre-loaded items in the furnace count toward available stock — if the furnace already has the input or fuel from a prior smelt, the mod uses what's there and only pushes the shortfall from inventory. Auto-fuel ranking prefers any pre-loaded valid fuel (so we don't pointlessly evict it); otherwise **combines fuels** across tiers (sticks → saplings → planks → logs → charcoal → coal → coal_block → lava_bucket) until the burn budget is covered. The Smelter feeds each fuel type into the fuel slot in sequence, waiting for the slot to drain between types. Blocks for `~10s × count` plus open/close overhead. `count` is hard-capped at 64 per call (furnace input/output slot limits).
 
-`/baritone/*` requires Baritone installed at runtime (we depend on `baritone-api-fabric-1.13.1`). If absent, all five endpoints return `{success: false, reason: "baritone_not_loaded"}` and the rest of the mod is unaffected. `/baritone/mine`, `/goto`, `/excavate`, and `/fill` share a session lock — one in flight at a time, the others return `reason: "busy"`. `/baritone/stop` bypasses the lock so it can interrupt the active call. The `count` field on `/baritone/mine` is **cumulative inventory target** (Baritone's own semantics), not a delta — and we short-circuit to `reason: "already_satisfied"` if the target is already met before invoking Baritone.
+`/baritone/*` requires Baritone installed at runtime (we depend on `baritone-api-fabric-1.13.1`). If absent, every `/baritone/*` endpoint returns `{success: false, reason: "baritone_not_loaded"}` and the rest of the mod is unaffected. `/baritone/mine`, `/goto`, `/excavate`, `/fill`, and `/follow` share a session lock — one in flight at a time, the others return `reason: "busy"`. `/baritone/stop` bypasses the lock so it can interrupt the active call. The `count` field on `/baritone/mine` is **cumulative inventory target** (Baritone's own semantics), not a delta — and we short-circuit to `reason: "already_satisfied"` if the target is already met before invoking Baritone.
 
 `/baritone/excavate` and `/baritone/fill` are axis-aligned-box primitives: excavate clears a box (calls `IBuilderProcess.clearArea`), fill places a block at every air cell in a box (calls `build()` with a `FillSchematic`). Both cap at **500 blocks** of volume — shelter-sized. `excavate` preserves player-placed torches (`buildIgnoreBlocks`). `fill` requires the fill block to already be in the player's hotbar (Baritone won't reach into main inventory) — pair with `/equip` first, or the call returns `missing_block`. Composition for a floored shelter: excavate the volume → equip cobblestone → fill the floor slice (`y1==y2`).
 
 A subtle implementation detail worth mentioning: `BlockOptionalMeta` (Baritone's drop-aware block matcher) deadlocks the render thread if constructed from the game thread on a multiplayer client — its constructor synchronously joins on a registry future that needs the render thread to make progress. We dodge this by constructing BOMs on the HTTP worker thread before the `mine()` call. See `SPEC.md`'s "Off-thread BOM prewarm" for the diagnostic and rationale.
+
+**Perception & state.** `/stats` is the full status snapshot — vitals, active potion `effects[]`, experience, and world context (biome, dimension, gamemode, day/night, weather, on-ground/in-water/in-lava/on-fire/sleeping). The `/scan_*` family is for spatial perception the blind agent can't get from look direction: `/scan_blocks` enumerates an axis-aligned box, `/scan_entities` finds entities of a `type` within `radius`, `/scan_nearest` finds the closest blocks matching any of `ids`. `/deaths` is a death log with an optional `?since=` (ms epoch) filter. All are read-only and don't touch game state beyond reading it on the client thread.
+
+**`/place_at` vs `/place`.** `/place` auto-picks a spot near the player's feet (the agent owns no fine positioning); `/place_at` places at an exact coordinate using the block below as support — for doors and other multi-cell items, give the bottom cell and MC fills the upper half. `/food_policy` sets which foods the offhand-food curator stages for AutoEat (`any` for daily driving, `cooked_only` for cook-capability tests where raw meat must never be auto-eaten).
+
+**Smelting flow.** `/smelt` is fire-and-forget: it pre-checks, auto-places a furnace if none is in reach, ignites, and returns a registry handle immediately. Poll `/smelt_status` for progress; `/collect_smelt` routes the player to a registered furnace and withdraws ready output.
+
+**Reflexes (`/evasion`, `/water_aversion`).** Both follow an arm → (poll `/status`) → disarm lifecycle the Python harness drives once per turn. The watcher runs autonomously: on trigger (hostile hit / eye-submergence) it cancels any active Baritone task and flees — evasion back toward the armed anchor, water-aversion to a dry-land cell computed at fire time. Disarming does **not** cancel an in-progress flee.
+
+**Recording / overlays.** Three toggles suppress on-screen overlays so headless captures stay clean (these agents are recorded for manual review): `/hud` controls vanilla Minecraft HUD elements per-element (or `{"all":false}`), `/wurst/hud` hides Wurst's logo/hacklist/TabGui, `/baritone/render` hides Baritone's path/goal/selection visuals. Defaults reflect intent — Wurst's HUD is pure clutter so it defaults **hidden**; the vanilla HUD and Baritone overlay are useful, so they default **visible** and are merely made toggleable. All are implemented as flag-gated render-cancel mixins.
 
 See `SPEC.md` for full request/response schemas including all failure reasons and structured-error fields.
 
@@ -98,8 +174,16 @@ curl -s -X POST http://127.0.0.1:25566/baritone/excavate \
 curl -s -X POST http://127.0.0.1:25566/baritone/fill \
   -d '{"block":"cobblestone","x1":12,"y1":62,"z1":-7,"x2":15,"y2":62,"z2":-4}' | jq
 
-# Baritone: cancel anything in flight (mine / goto / excavate / fill)
+# Baritone: cancel anything in flight (mine / goto / excavate / fill / follow)
 curl -s -X POST http://127.0.0.1:25566/baritone/stop | jq
+
+# Full status snapshot (vitals + effects + world)
+curl -s http://127.0.0.1:25566/stats | jq
+
+# Recording prep: hide the whole vanilla HUD, the Wurst HUD, and Baritone's overlay
+curl -s -X POST http://127.0.0.1:25566/hud -d '{"all":false}' | jq
+curl -s -X POST http://127.0.0.1:25566/wurst/hud -d '{"visible":false}' | jq
+curl -s -X POST http://127.0.0.1:25566/baritone/render -d '{"visible":false}' | jq
 ```
 
 Successful craft response:
@@ -190,4 +274,4 @@ Primary loop is manual curl + watching the game. No automated test framework in 
 
 ## Status
 
-v1 functionally complete: `/inventory`, `/position`, `/scan_column`, `/craft` (2×2 and 3×3), `/place`, `/equip`, `/smelt`, `/baritone/mine`, `/baritone/goto`, `/baritone/excavate`, `/baritone/fill`, `/baritone/stop` all working end-to-end on both single-player and multiplayer. SP and MP share one code path — recipes are sourced from `ClientRecipeBook`, the same display-side API the in-game recipe book screen uses (it carries furnace recipes alongside crafting-grid ones). Baritone endpoints depend on the API jar at runtime; if Baritone isn't installed, those five return `baritone_not_loaded` and the rest of the mod is unaffected.
+v1 functionally complete: `/inventory`, `/position`, `/scan_column`, `/craft` (2×2 and 3×3), `/place`, `/equip`, `/smelt`, `/baritone/mine`, `/baritone/goto`, `/baritone/excavate`, `/baritone/fill`, `/baritone/stop` all working end-to-end on both single-player and multiplayer. SP and MP share one code path — recipes are sourced from `ClientRecipeBook`, the same display-side API the in-game recipe book screen uses (it carries furnace recipes alongside crafting-grid ones). Baritone endpoints depend on the API jar at runtime; if Baritone isn't installed, every `/baritone/*` route returns `baritone_not_loaded` and the rest of the mod is unaffected. The surface has since grown well beyond v1 — see the HTTP API table above for the complete, current endpoint list (perception/state, smelting, sleep, reflexes, the Wurst bridge, and overlay-control toggles).
