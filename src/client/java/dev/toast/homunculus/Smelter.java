@@ -373,64 +373,60 @@ public final class Smelter {
 		final int INV_END = FURNACE_SLOTS + 36;
 		final int MAX_ATTEMPTS = 16;
 
-		Integer initial = supply(() -> {
-			LocalPlayer p = mc.player;
-			if (p == null) return null;
-			AbstractContainerMenu menu = p.containerMenu;
-			if (menu.containerId != containerId) return null;
-			return countInInvPortion(menu, item, FURNACE_SLOTS, INV_END);
-		});
-		if (initial == null) {
-			return new ExecutionFailure("menu vanished before pushing " + BuiltInRegistries.ITEM.getKey(item));
-		}
-		final int initialInvCount = initial;
-
-		for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-			int status = supply(() -> {
+		// Move EXACTLY `needed` of `item` into targetSlot. We deliberately avoid
+		// ClickType.QUICK_MOVE (shift-click): it moves the WHOLE source stack
+		// regardless of `needed`, over-loading the furnace and stranding the
+		// unmoved remainder inside it — observed as a 2-item cook shift-clicking
+		// all 8 coal into the fuel slot, leaving inventory empty (no_fuel) for the
+		// next cook. Instead, per attempt: pick a source stack onto the cursor,
+		// right-click `needed` singles into the target, and left-click the
+		// remainder back into the source slot. Multiple source stacks are drained
+		// across attempts until `needed` is placed.
+		int remaining = needed;
+		for (int attempt = 0; attempt < MAX_ATTEMPTS && remaining > 0; attempt++) {
+			final int want = remaining;
+			Integer placed = supply(() -> {
 				LocalPlayer p = mc.player;
-				if (p == null) return -2;
+				if (p == null) return null;
 				AbstractContainerMenu menu = p.containerMenu;
-				if (menu.containerId != containerId) return -2;
+				if (menu.containerId != containerId) return null;
 
-				int currentInv = 0;
 				int sourceSlot = -1;
 				for (int s = FURNACE_SLOTS; s < INV_END; s++) {
 					ItemStack stk = menu.getSlot(s).getItem();
-					if (!stk.isEmpty() && stk.getItem() == item) {
-						currentInv += stk.getCount();
-						if (sourceSlot < 0) sourceSlot = s;
-					}
+					if (!stk.isEmpty() && stk.getItem() == item) { sourceSlot = s; break; }
 				}
-				int transferred = initialInvCount - currentInv;
-				if (transferred >= needed) return 0;
-				if (sourceSlot < 0) return -1;
+				if (sourceSlot < 0) return 0;  // nothing left in inventory to move
 
-				mc.gameMode.handleInventoryMouseClick(containerId, sourceSlot, 0, ClickType.QUICK_MOVE, p);
-				return 1;
+				// Pick up the source stack, deposit `want` singles into the target,
+				// then return whatever's left on the cursor to the source slot.
+				mc.gameMode.handleInventoryMouseClick(containerId, sourceSlot, 0, ClickType.PICKUP, p);
+				int toPlace = Math.min(want, menu.getCarried().getCount());
+				for (int i = 0; i < toPlace; i++) {
+					mc.gameMode.handleInventoryMouseClick(containerId, targetSlot, 1, ClickType.PICKUP, p);
+				}
+				if (!menu.getCarried().isEmpty()) {
+					mc.gameMode.handleInventoryMouseClick(containerId, sourceSlot, 0, ClickType.PICKUP, p);
+				}
+				return toPlace;
 			});
 
-			if (status == 0) return null;
-			if (status == -1) {
-				return new ExecutionFailure("ran out of " + BuiltInRegistries.ITEM.getKey(item)
-						+ " in inventory before " + needed + " were transferred to slot " + targetSlot);
-			}
-			if (status == -2) {
+			if (placed == null) {
 				return new ExecutionFailure("player or furnace menu vanished while pushing "
 						+ BuiltInRegistries.ITEM.getKey(item));
 			}
-			Thread.sleep(CLICK_SETTLE_MS);
+			if (placed == 0) {
+				return new ExecutionFailure("ran out of " + BuiltInRegistries.ITEM.getKey(item)
+						+ " in inventory before " + needed + " were transferred to slot " + targetSlot);
+			}
+			remaining -= placed;
+			if (remaining > 0) Thread.sleep(CLICK_SETTLE_MS);
 		}
-		return new ExecutionFailure("could not push " + needed + " " + BuiltInRegistries.ITEM.getKey(item)
-				+ " into slot " + targetSlot + " after " + MAX_ATTEMPTS + " attempts");
-	}
-
-	private static int countInInvPortion(AbstractContainerMenu menu, Item item, int from, int toExcl) {
-		int total = 0;
-		for (int s = from; s < toExcl; s++) {
-			ItemStack stk = menu.getSlot(s).getItem();
-			if (!stk.isEmpty() && stk.getItem() == item) total += stk.getCount();
+		if (remaining > 0) {
+			return new ExecutionFailure("could not push " + needed + " " + BuiltInRegistries.ITEM.getKey(item)
+					+ " into slot " + targetSlot + " after " + MAX_ATTEMPTS + " attempts");
 		}
-		return total;
+		return null;
 	}
 
 	private static ExecutionFailure openFurnace(Minecraft mc, BlockPos pos) {
