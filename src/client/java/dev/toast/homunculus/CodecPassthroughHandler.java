@@ -58,6 +58,7 @@ public final class CodecPassthroughHandler implements HttpHandler {
 
     private void handleArm(HttpExchange exchange) throws IOException {
         String endpoint;
+        String inferenceUrl = null;
         try {
             byte[] bytes = exchange.getRequestBody().readNBytes(MAX_BODY_BYTES + 1);
             if (bytes.length > MAX_BODY_BYTES) {
@@ -80,12 +81,17 @@ public final class CodecPassthroughHandler implements HttpHandler {
                 return;
             }
             endpoint = s;
+            // inference_url is optional — omit to disable neural inference logging.
+            Object iv = map.get("inference_url");
+            if (iv instanceof String is && !is.isBlank()) {
+                inferenceUrl = is;
+            }
         } catch (Exception e) {
             respond(exchange, 400, failure("bad_request", "bad json: " + rootMessage(e)));
             return;
         }
         try {
-            respond(exchange, 200, CodecPassthrough.INSTANCE.arm(endpoint));
+            respond(exchange, 200, CodecPassthrough.INSTANCE.arm(endpoint, inferenceUrl));
         } catch (Exception e) {
             respond(exchange, 500, failure("internal_error", "arm failed: " + rootMessage(e)));
         }

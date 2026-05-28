@@ -68,6 +68,11 @@ public final class CodecPassthrough {
 
     private volatile boolean armed = false;
     private volatile String endpoint = null;
+    // Optional: when set, each packet's obs is also POSTed to the inference
+    // server alongside the codec round-trip. The response's predicted_type is
+    // compared to the actual packet id and counted in predictedCorrect /
+    // predictedTotal. Does not affect the wire — purely observational.
+    private volatile String inferenceUrl = null;
     private volatile long armedAtMs = 0L;
 
     private final Object lifecycleLock = new Object();
@@ -81,6 +86,9 @@ public final class CodecPassthrough {
     private final AtomicLong transportErrors = new AtomicLong();
     private final AtomicLong queueDrops = new AtomicLong();
     private final AtomicLong noObs = new AtomicLong();
+    // Inference prediction counters (only meaningful when inferenceUrl is set).
+    private final AtomicLong predictedTotal = new AtomicLong();
+    private final AtomicLong predictedCorrect = new AtomicLong();
 
     // Per-packet-type drift log counters — capped so a broken codec doesn't
     // flood logs. Created lazily because the set of ids is small.
@@ -97,7 +105,13 @@ public final class CodecPassthrough {
      * counters. Idempotent against double-arm: a second arm closes the prior
      * worker first.
      */
-    public Map<String, Object> arm(String endpointUrl) {
+    /**
+     * @param endpointUrl   codec round-trip URL (required)
+     * @param inferenceUrl  optional neural inference URL; if non-blank, each
+     *                      packet's obs is also sent to this endpoint and the
+     *                      predicted_type is compared to the actual packet id.
+     */
+    public Map<String, Object> arm(String endpointUrl, String inferenceUrl) {
         if (endpointUrl == null || endpointUrl.isBlank()) {
             throw new IllegalArgumentException("endpoint must be a non-empty URL");
         }
@@ -115,6 +129,7 @@ public final class CodecPassthrough {
             this.http = client;
             this.workerThread = t;
             this.endpoint = endpointUrl;
+            this.inferenceUrl = (inferenceUrl != null && !inferenceUrl.isBlank()) ? inferenceUrl : null;
             this.armedAtMs = System.currentTimeMillis();
             attempted.set(0);
             ok.set(0);
@@ -122,12 +137,19 @@ public final class CodecPassthrough {
             transportErrors.set(0);
             queueDrops.set(0);
             noObs.set(0);
+            predictedTotal.set(0);
+            predictedCorrect.set(0);
             driftLogCounts.clear();
             armed = true;
             t.start();
-            HomunculusClient.LOGGER.info("[codec-passthrough] armed → {}", endpointUrl);
+            HomunculusClient.LOGGER.info("[codec-passthrough] armed → {} (inference: {})",
+                    endpointUrl, this.inferenceUrl != null ? this.inferenceUrl : "none");
             return snapshot();
         }
+    }
+
+    public Map<String, Object> arm(String endpointUrl) {
+        return arm(endpointUrl, null);
     }
 
     public Map<String, Object> disarm() {
@@ -145,6 +167,8 @@ public final class CodecPassthrough {
             m.put("transport_errors", transportErrors.get());
             m.put("queue_drops", queueDrops.get());
             m.put("no_obs", noObs.get());
+            m.put("predicted_total", predictedTotal.get());
+            m.put("predicted_correct", predictedCorrect.get());
             return m;
         }
     }
@@ -188,6 +212,11 @@ public final class CodecPassthrough {
         m.put("transport_errors", transportErrors.get());
         m.put("queue_drops", queueDrops.get());
         m.put("no_obs", noObs.get());
+        m.put("predicted_total", predictedTotal.get());
+        m.put("predicted_correct", predictedCorrect.get());
+        if (predictedTotal.get() > 0) {
+            m.put("predicted_accuracy", (double) predictedCorrect.get() / predictedTotal.get());
+        }
         return m;
     }
 
@@ -199,14 +228,30 @@ public final class CodecPassthrough {
             HomunculusClient.LOGGER.warn("[codec-passthrough] bad endpoint, draining will no-op: {}", t.toString());
             return;
         }
-        HttpRequest.Builder template = HttpRequest.newBuilder(uri)
+        String infUrl = inferenceUrl; // snapshot at drain-start; null if not set
+        URI inferUri = null;
+        if (infUrl != null) {
+            try {
+                inferUri = URI.create(infUrl);
+            } catch (Throwable t) {
+                HomunculusClient.LOGGER.warn("[codec-passthrough] bad inference_url, inference disabled: {}", t.toString());
+            }
+        }
+        HttpRequest.Builder codecTemplate = HttpRequest.newBuilder(uri)
                 .timeout(Duration.ofMillis(REQUEST_TIMEOUT_MS))
                 .header("Content-Type", "application/json");
+        HttpRequest.Builder inferTemplate = inferUri == null ? null
+                : HttpRequest.newBuilder(inferUri)
+                    .timeout(Duration.ofMillis(REQUEST_TIMEOUT_MS))
+                    .header("Content-Type", "application/json");
         try {
             while (true) {
                 Task task = q.take();
                 if (POISON_ID.equals(task.packetId)) break;
-                send(client, template, task);
+                send(client, codecTemplate, task);
+                if (inferTemplate != null) {
+                    infer(client, inferTemplate, task);
+                }
             }
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
@@ -258,6 +303,58 @@ public final class CodecPassthrough {
         }
     }
 
+    /**
+     * POST obs to the inference server and compare the predicted_type to the
+     * actual packet id. Increments predictedTotal / predictedCorrect.
+     * Fire-and-count: errors are logged but do not increment drift counters
+     * (inference is separate from codec correctness).
+     */
+    private void infer(HttpClient client, HttpRequest.Builder template, Task task) {
+        // The inference server only needs obs, not fields. Re-use task.body
+        // which already has "obs" embedded; send the whole body and let the
+        // server ignore extra keys (it reads only "obs").
+        try {
+            // Build a minimal {"obs": {...}} body from the task body's obs field.
+            // task.body is {"id":..., "fields":..., "obs":..., "ts_ms":...}.
+            // The inference server accepts that shape too (it reads "obs" key).
+            HttpRequest req = template.copy()
+                    .POST(HttpRequest.BodyPublishers.ofString(task.body, StandardCharsets.UTF_8))
+                    .build();
+            HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (resp.statusCode() / 100 != 2) {
+                HomunculusClient.LOGGER.debug("[codec-passthrough/infer] non-2xx {} for {}", resp.statusCode(), task.packetId);
+                return;
+            }
+            Object parsed;
+            try {
+                parsed = Json.parse(resp.body());
+            } catch (Throwable t) {
+                return;
+            }
+            if (!(parsed instanceof Map<?, ?> m)) return;
+            Object predicted = m.get("predicted_type");
+            if (!(predicted instanceof String predictedStr)) return;
+            predictedTotal.incrementAndGet();
+            boolean correct = task.packetId.equals(predictedStr);
+            if (correct) predictedCorrect.incrementAndGet();
+            // Log mismatches at DEBUG — at inference these will be ~35% wrong
+            // and we don't want info-level spam.
+            Object conf = ((Map<?, ?>) m).get("confidence");
+            Object latMs = ((Map<?, ?>) m).get("latency_ms");
+            HomunculusClient.LOGGER.debug(
+                    "[codec-passthrough/infer] actual={} predicted={} conf={} latency_ms={}{}",
+                    task.packetId, predictedStr,
+                    conf != null ? conf : "?",
+                    latMs != null ? latMs : "?",
+                    correct ? "" : " WRONG");
+        } catch (IOException | InterruptedException e) {
+            HomunculusClient.LOGGER.debug("[codec-passthrough/infer] transport error: {}", e.toString());
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+        } catch (Throwable t) {
+            HomunculusClient.LOGGER.debug("[codec-passthrough/infer] unexpected: {}", t.toString());
+        }
+    }
+
     private void logBounded(String packetId, String message) {
         AtomicLong counter = driftLogCounts.computeIfAbsent(packetId, k -> new AtomicLong());
         long n = counter.incrementAndGet();
@@ -298,10 +395,15 @@ public final class CodecPassthrough {
             }
         }
         if (e != null) {
+            long ptotal = predictedTotal.get();
+            String inferStats = ptotal > 0
+                    ? String.format(" infer=%d/%d(%.2f)", predictedCorrect.get(), ptotal,
+                            (double) predictedCorrect.get() / ptotal)
+                    : "";
             HomunculusClient.LOGGER.info(
-                    "[codec-passthrough] disarmed (attempted={}, ok={}, drift={}, transport={}, drops={}, no_obs={}) → {}",
+                    "[codec-passthrough] disarmed (attempted={}, ok={}, drift={}, transport={}, drops={}, no_obs={}{}) → {}",
                     attempted.get(), ok.get(), drift.get(),
-                    transportErrors.get(), queueDrops.get(), noObs.get(), e);
+                    transportErrors.get(), queueDrops.get(), noObs.get(), inferStats, e);
         }
     }
 
