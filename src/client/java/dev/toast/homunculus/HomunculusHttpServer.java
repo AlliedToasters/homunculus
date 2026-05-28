@@ -70,6 +70,15 @@ public final class HomunculusHttpServer {
 		server.createContext("/packets/recording/arm", recordingHandler);
 		server.createContext("/packets/recording/disarm", recordingHandler);
 		server.createContext("/packets/recording/status", recordingHandler);
+		// Phase 2 step 2: live structured-codec passthrough. When armed,
+		// every allowlisted outbound packet's fields are POSTed to a Python
+		// codec server (craft.codec.server), round-tripped, and drift counters
+		// incremented. Does NOT substitute bytes on the wire — that's a
+		// separate lift after step 2 shows zero drift.
+		CodecPassthroughHandler codecPassthroughHandler = new CodecPassthroughHandler();
+		server.createContext("/codec/passthrough/arm", codecPassthroughHandler);
+		server.createContext("/codec/passthrough/disarm", codecPassthroughHandler);
+		server.createContext("/codec/passthrough/status", codecPassthroughHandler);
 		server.createContext("/debug/door_courtesy", new DoorCourtesyDebugHandler());
 		// Reflexive evasion — one handler, three paths. Python arms once per turn,
 		// optionally polls /status mid-turn, disarms at end. The watcher itself

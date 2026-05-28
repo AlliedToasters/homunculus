@@ -1,5 +1,6 @@
 package dev.toast.homunculus.mixin;
 
+import dev.toast.homunculus.CodecPassthrough;
 import dev.toast.homunculus.PacketAllowlist;
 import dev.toast.homunculus.PacketRecorder;
 import dev.toast.homunculus.PacketRoundtrip;
@@ -80,6 +81,13 @@ public abstract class OutboundPacketMixin {
         if (idStr != null && PacketRecorder.INSTANCE.isArmed()
                 && PacketAllowlist.SPATIAL_PLAY.contains(idStr)) {
             PacketRecorder.INSTANCE.record(packet, idStr, System.currentTimeMillis());
+        }
+        // Live codec passthrough is also independent of round-trip: when
+        // armed, fields are shipped to the Python codec server async. Never
+        // affects what goes on the wire.
+        if (idStr != null && CodecPassthrough.INSTANCE.isArmed()
+                && PacketAllowlist.SPATIAL_PLAY.contains(idStr)) {
+            CodecPassthrough.INSTANCE.observe(packet, idStr, System.currentTimeMillis());
         }
 
         if (!PacketRoundtrip.INSTANCE.isEnabled()) return;
