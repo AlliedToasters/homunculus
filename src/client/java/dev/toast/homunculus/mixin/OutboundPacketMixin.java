@@ -1,6 +1,7 @@
 package dev.toast.homunculus.mixin;
 
 import dev.toast.homunculus.PacketAllowlist;
+import dev.toast.homunculus.PacketRecorder;
 import dev.toast.homunculus.PacketRoundtrip;
 import dev.toast.homunculus.PacketTap;
 import io.netty.channel.Channel;
@@ -72,9 +73,17 @@ public abstract class OutboundPacketMixin {
         if (ROUNDTRIPPING.get()) return; // recursive call from our own substitute send → pass through
         PacketTap.INSTANCE.observe(packet);
 
-        if (!PacketRoundtrip.INSTANCE.isEnabled()) return;
         ResourceLocation id = packet.type() == null ? null : packet.type().id();
-        if (id == null || !PacketAllowlist.SPATIAL_PLAY.contains(id.toString())) return;
+        String idStr = id == null ? null : id.toString();
+        // Recording is independent of round-trip: capture (packet, obs) pairs
+        // for the Phase 2 structured codec even when round-trip is disabled.
+        if (idStr != null && PacketRecorder.INSTANCE.isArmed()
+                && PacketAllowlist.SPATIAL_PLAY.contains(idStr)) {
+            PacketRecorder.INSTANCE.record(packet, idStr, System.currentTimeMillis());
+        }
+
+        if (!PacketRoundtrip.INSTANCE.isEnabled()) return;
+        if (idStr == null || !PacketAllowlist.SPATIAL_PLAY.contains(idStr)) return;
 
         Connection self = (Connection) (Object) this;
         Packet<?> clone = PacketRoundtrip.INSTANCE.tryRoundtrip(packet, this.channel);

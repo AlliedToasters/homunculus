@@ -63,6 +63,13 @@ public final class HomunculusHttpServer {
 		// Phase 1: byte round-trip kill switch + counters. POST {"enabled":bool}
 		// flips the global flag; the mixin checks it per outbound packet.
 		server.createContext("/packets/roundtrip", new PacketRoundtripHandler());
+		// Phase 2 prep: capture (packet, obs) pairs to JSONL so the Python
+		// structured codec can be tested offline against real rollouts
+		// before any live substitution work (ml.MD §4a test-ladder step 1).
+		PacketRecordingHandler recordingHandler = new PacketRecordingHandler();
+		server.createContext("/packets/recording/arm", recordingHandler);
+		server.createContext("/packets/recording/disarm", recordingHandler);
+		server.createContext("/packets/recording/status", recordingHandler);
 		server.createContext("/debug/door_courtesy", new DoorCourtesyDebugHandler());
 		// Reflexive evasion — one handler, three paths. Python arms once per turn,
 		// optionally polls /status mid-turn, disarms at end. The watcher itself

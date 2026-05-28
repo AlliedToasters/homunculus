@@ -23,6 +23,7 @@ public final class HomunculusClient implements ClientModInitializer {
 		WaterAversion.register();
 		ShearReflex.register();
 		AutoShears.register();
+		PlayerObsSnapshot.register();
 		ClientLifecycleEvents.CLIENT_STARTED.register(client -> {
 			try {
 				httpServer.start();
