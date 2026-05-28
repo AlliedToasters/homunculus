@@ -83,6 +83,13 @@ public final class HomunculusHttpServer {
 		// pushes g_t / current_tool / waiting_on_llm here at turn boundaries;
 		// every recorded packet line is stamped with the carry-forwarded state.
 		server.createContext("/obs/meta", new ObsMetaHandler());
+		// Heavy tick-indexed obs sidecar (neural_interface.md §8e): block cube +
+		// entity list + baritone_state, one row per tick, joined to the packet
+		// recording by tick. Independent lifecycle so light recordings stay light.
+		ObsSidecarHandler obsSidecarHandler = new ObsSidecarHandler();
+		server.createContext("/obs/sidecar/arm", obsSidecarHandler);
+		server.createContext("/obs/sidecar/disarm", obsSidecarHandler);
+		server.createContext("/obs/sidecar/status", obsSidecarHandler);
 		server.createContext("/debug/door_courtesy", new DoorCourtesyDebugHandler());
 		// Reflexive evasion — one handler, three paths. Python arms once per turn,
 		// optionally polls /status mid-turn, disarms at end. The watcher itself

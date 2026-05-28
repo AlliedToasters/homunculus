@@ -24,6 +24,11 @@ public final class HomunculusClient implements ClientModInitializer {
 		ShearReflex.register();
 		AutoShears.register();
 		PlayerObsSnapshot.register();
+		// MUST come after PlayerObsSnapshot.register(): the sidecar reads
+		// PlayerObsSnapshot.currentTick() at END_CLIENT_TICK and Fabric fires
+		// tick callbacks in registration order, so the obs tick is already
+		// incremented when the sidecar stamps its row (neural_interface.md §8e).
+		TickSidecarRecorder.register();
 		ClientLifecycleEvents.CLIENT_STARTED.register(client -> {
 			try {
 				httpServer.start();
