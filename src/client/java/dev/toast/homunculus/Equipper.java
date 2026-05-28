@@ -10,9 +10,9 @@ import net.minecraft.world.food.FoodProperties;
 import net.minecraft.world.inventory.ClickType;
 import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.item.AxeItem;
-import net.minecraft.world.item.HoeItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.item.PickaxeItem;
 import net.minecraft.world.item.ShovelItem;
 import net.minecraft.world.item.SwordItem;
@@ -34,8 +34,15 @@ import java.util.function.Supplier;
  * Auto-equips the "best" item per role across the player's inventory.
  *
  * Hotbar layout (0-indexed):
- *   0 sword, 1 axe, 2 pickaxe, 3 shovel, 4 hoe, 5 food, 6 building blocks,
+ *   0 sword, 1 axe, 2 pickaxe, 3 shovel, 4 shears, 5 food, 6 building blocks,
  *   7-8 untouched (caller-managed misc).
+ *
+ * Slot 4 was previously hoe; hoes are unused in our survival flow (no crop farming).
+ * Repurposed for shears: pairs with ShearReflex, which fires only when shears are in
+ * MAIN hand. Reflex only triggers when slot 4 is selected — but Equipper keeps shears
+ * staged so the agent (or AutoTool) can switch to slot 4 with one slot-select and harvest
+ * any sheep in 3.5m. Without this, agents almost never had shears in hand at the right
+ * moment for the reflex to compose with travel/hunt routines.
  *
  * Armor: best per HEAD/CHEST/LEGS/FEET via Equippable component.
  *
@@ -89,7 +96,7 @@ public final class Equipper {
 		applyHotbarRole(mc, "axe",      1, Equipper::isAxe,      Equipper::compareTool,     changes);
 		applyHotbarRole(mc, "pickaxe",  2, Equipper::isPickaxe,  Equipper::compareTool,     changes);
 		applyHotbarRole(mc, "shovel",   3, Equipper::isShovel,   Equipper::compareTool,     changes);
-		applyHotbarRole(mc, "hoe",      4, Equipper::isHoe,      Equipper::compareTool,     changes);
+		applyHotbarRole(mc, "shears",   4, Equipper::isShears,   Equipper::compareTool,     changes);
 		applyHotbarRole(mc, "food",     5, Equipper::isApprovedFood, Equipper::compareFood, changes);
 		applyHotbarRole(mc, "building", 6, Equipper::isBuilding, Equipper::compareBuilding, changes);
 
@@ -322,7 +329,7 @@ public final class Equipper {
 	private static boolean isAxe(ItemStack s)      { return s.getItem() instanceof AxeItem; }
 	private static boolean isPickaxe(ItemStack s)  { return s.getItem() instanceof PickaxeItem; }
 	private static boolean isShovel(ItemStack s)   { return s.getItem() instanceof ShovelItem; }
-	private static boolean isHoe(ItemStack s)      { return s.getItem() instanceof HoeItem; }
+	private static boolean isShears(ItemStack s)   { return s.getItem() == Items.SHEARS; }
 	private static boolean isFood(ItemStack s)     { return s.has(DataComponents.FOOD); }
 	/** Food the current {@link FoodPolicy} permits auto-eating: any food under ANY,
 	 *  non-raw-meat food under COOKED_ONLY. Drives both the slot-5 food role and the
@@ -433,7 +440,7 @@ public final class Equipper {
 		map.put("axe",      roleSlotIdIf(inv.items.get(1), Equipper::isAxe));
 		map.put("pickaxe",  roleSlotIdIf(inv.items.get(2), Equipper::isPickaxe));
 		map.put("shovel",   roleSlotIdIf(inv.items.get(3), Equipper::isShovel));
-		map.put("hoe",      roleSlotIdIf(inv.items.get(4), Equipper::isHoe));
+		map.put("shears",   roleSlotIdIf(inv.items.get(4), Equipper::isShears));
 		map.put("food",     roleSlotIdIf(inv.items.get(5), Equipper::isFood));
 		map.put("building", roleSlotIdIf(inv.items.get(6), Equipper::isBuilding));
 		map.put("head",     idOf(inv.armor.get(EquipmentSlot.HEAD.getIndex())));

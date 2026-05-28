@@ -41,6 +41,7 @@ public final class HomunculusHttpServer {
 		server.createContext("/craft", new CraftHandler());
 		server.createContext("/bed/place", new BedPlaceHandler());
 		server.createContext("/bed/sleep", new SleepHandler());
+		server.createContext("/shear/sheep", new ShearHandler());
 		server.createContext("/place", new PlaceHandler());
 		server.createContext("/place_at", new PlaceAtHandler());
 		server.createContext("/equip", new EquipHandler());

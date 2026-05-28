@@ -4,6 +4,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.phys.Vec3;
 
 /**
@@ -23,6 +24,19 @@ public final class Look {
 		double dx = (pos.getX() + 0.5) - eye.x;
 		double dy = (pos.getY() + 1.0) - eye.y;
 		double dz = (pos.getZ() + 0.5) - eye.z;
+		aim(p, dx, dy, dz);
+	}
+
+	/** Aims the player's view at the eye position of {@code target}. No-op if no player. */
+	public static void faceEntity(Minecraft mc, Entity target) {
+		LocalPlayer p = mc.player;
+		if (p == null || target == null) return;
+		Vec3 eye = p.getEyePosition();
+		Vec3 tgt = target.getEyePosition();
+		aim(p, tgt.x - eye.x, tgt.y - eye.y, tgt.z - eye.z);
+	}
+
+	private static void aim(LocalPlayer p, double dx, double dy, double dz) {
 		float yaw = (float) (Math.atan2(-dx, dz) * (180.0 / Math.PI));
 		double horiz = Math.sqrt(dx * dx + dz * dz);
 		float pitch = (float) (-Math.atan2(dy, horiz) * (180.0 / Math.PI));
