@@ -15,6 +15,8 @@ import net.minecraft.world.phys.Vec3;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -28,6 +30,7 @@ import java.util.Map;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.zip.GZIPOutputStream;
 
 /**
  * Heavy tick-indexed sidecar for the obs-ablation frozen capture
@@ -70,6 +73,7 @@ public final class TickSidecarRecorder {
     private volatile boolean armed = false;
     private volatile Path currentPath = null;
     private volatile long armedAtMs = 0L;
+    private volatile boolean gzip = false;
 
     private final Object lifecycleLock = new Object();
     private LinkedBlockingQueue<Map<String, Object>> queue;
@@ -217,19 +221,27 @@ public final class TickSidecarRecorder {
         return m;
     }
 
-    public Map<String, Object> arm(String pathOrNull) throws IOException {
+    /**
+     * @param gzip when true, stream-compress the JSONL through a
+     *     {@link GZIPOutputStream} (the row data is highly repetitive →
+     *     ~5–10×). Opt-in: the default plain writer keeps the channel cheap if
+     *     it is ever armed mid-fleet-run; the frozen-capture runner (few agents)
+     *     turns it on.
+     */
+    public Map<String, Object> arm(String pathOrNull, boolean gzip) throws IOException {
         synchronized (lifecycleLock) {
             if (armed) {
                 closeStream();
             }
-            Path target = resolvePath(pathOrNull);
+            Path target = resolvePath(pathOrNull, gzip);
             Files.createDirectories(target.getParent());
-            BufferedWriter w = Files.newBufferedWriter(
+            BufferedWriter w = gzip ? newGzipWriter(target) : Files.newBufferedWriter(
                     target,
                     StandardCharsets.UTF_8,
                     StandardOpenOption.CREATE,
                     StandardOpenOption.WRITE,
                     StandardOpenOption.APPEND);
+            this.gzip = gzip;
             LinkedBlockingQueue<Map<String, Object>> q = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
             Thread t = new Thread(() -> drain(w, q), "homunculus-tick-sidecar");
             t.setDaemon(true);
@@ -256,6 +268,7 @@ public final class TickSidecarRecorder {
             m.put("success", true);
             m.put("armed", false);
             m.put("path", finalPath == null ? null : finalPath.toString());
+            m.put("gzip", gzip);
             m.put("armed_at_ms", null);
             m.put("written", written.get());
             m.put("dropped_queue_full", droppedQueueFull.get());
@@ -270,6 +283,7 @@ public final class TickSidecarRecorder {
         m.put("success", true);
         m.put("armed", armed);
         m.put("path", currentPath == null ? null : currentPath.toString());
+        m.put("gzip", gzip);
         m.put("armed_at_ms", armedAtMs == 0L ? null : armedAtMs);
         m.put("written", written.get());
         m.put("dropped_queue_full", droppedQueueFull.get());
@@ -278,14 +292,29 @@ public final class TickSidecarRecorder {
         return m;
     }
 
-    private Path resolvePath(String pathOrNull) {
+    private static BufferedWriter newGzipWriter(Path target) throws IOException {
+        OutputStream os = Files.newOutputStream(
+                target,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING);
+        return new BufferedWriter(new OutputStreamWriter(new GZIPOutputStream(os), StandardCharsets.UTF_8));
+    }
+
+    private Path resolvePath(String pathOrNull, boolean gzip) {
+        Path p;
         if (pathOrNull != null && !pathOrNull.isBlank()) {
-            return Paths.get(pathOrNull).toAbsolutePath();
+            p = Paths.get(pathOrNull).toAbsolutePath();
+        } else {
+            String home = System.getProperty("user.home", ".");
+            String name = "sidecar-" + System.currentTimeMillis()
+                    + "-" + HomunculusClient.HTTP_PORT + ".jsonl";
+            p = Paths.get(home, ".homunculus", "recordings", name).toAbsolutePath();
         }
-        String home = System.getProperty("user.home", ".");
-        String name = "sidecar-" + System.currentTimeMillis()
-                + "-" + HomunculusClient.HTTP_PORT + ".jsonl";
-        return Paths.get(home, ".homunculus", "recordings", name).toAbsolutePath();
+        if (gzip && !p.toString().endsWith(".gz")) {
+            p = Paths.get(p + ".gz");
+        }
+        return p;
     }
 
     private void drain(BufferedWriter w, LinkedBlockingQueue<Map<String, Object>> q) {

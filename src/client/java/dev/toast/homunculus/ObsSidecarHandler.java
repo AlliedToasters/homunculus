@@ -60,6 +60,7 @@ public final class ObsSidecarHandler implements HttpHandler {
 
     private void handleArm(HttpExchange exchange) throws IOException {
         String path = null;
+        boolean gzip = false;
         try {
             byte[] bytes = exchange.getRequestBody().readNBytes(MAX_BODY_BYTES + 1);
             if (bytes.length > MAX_BODY_BYTES) {
@@ -79,13 +80,17 @@ public final class ObsSidecarHandler implements HttpHandler {
                     return;
                 }
                 path = (String) v;
+                // gzip is optional (default false) — stream-compress the JSONL.
+                if (map.get("gzip") instanceof Boolean b) {
+                    gzip = b;
+                }
             }
         } catch (Exception e) {
             respond(exchange, 400, failure("bad_request", "bad json: " + rootMessage(e)));
             return;
         }
         try {
-            respond(exchange, 200, TickSidecarRecorder.INSTANCE.arm(path));
+            respond(exchange, 200, TickSidecarRecorder.INSTANCE.arm(path, gzip));
         } catch (IOException e) {
             respond(exchange, 500, failure("internal_error", "arm failed: " + rootMessage(e)));
         }
