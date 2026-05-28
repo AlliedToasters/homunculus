@@ -79,6 +79,10 @@ public final class HomunculusHttpServer {
 		server.createContext("/codec/passthrough/arm", codecPassthroughHandler);
 		server.createContext("/codec/passthrough/disarm", codecPassthroughHandler);
 		server.createContext("/codec/passthrough/status", codecPassthroughHandler);
+		// Control-stack meta-observables (neural_interface.md §8f): the agent
+		// pushes g_t / current_tool / waiting_on_llm here at turn boundaries;
+		// every recorded packet line is stamped with the carry-forwarded state.
+		server.createContext("/obs/meta", new ObsMetaHandler());
 		server.createContext("/debug/door_courtesy", new DoorCourtesyDebugHandler());
 		// Reflexive evasion — one handler, three paths. Python arms once per turn,
 		// optionally polls /status mid-turn, disarms at end. The watcher itself

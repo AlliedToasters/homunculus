@@ -149,7 +149,7 @@ public final class PacketRecorder {
         entry.put("ts_ms", tsMs);
         entry.put("id", packetId);
         entry.put("fields", PacketFieldExtractor.extract(packet));
-        entry.put("obs", obs.toJson());
+        entry.put("obs", obs.toRecordJson());
         String line = Json.write(entry);
         LinkedBlockingQueue<String> q = queue;
         if (q == null) return; // race with disarm; drop silently
