@@ -9,6 +9,7 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 
@@ -20,6 +21,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -121,7 +123,7 @@ public final class TickSidecarRecorder {
         entry.put("origin", origin);
         entry.put("grid_radius", CAPTURE_GRID_RADIUS);
         entry.put("ent_radius", CAPTURE_ENT_RADIUS);
-        entry.put("block_grid", buildBlockGrid(level, ox, oy, oz));
+        addBlockGrid(entry, level, ox, oy, oz);
         entry.put("entity_set", buildEntitySet(p, level));
         entry.put("baritone_state", Baritone.isApiLoaded() ? BaritoneState.snapshot() : null);
         return entry;
@@ -129,12 +131,25 @@ public final class TickSidecarRecorder {
 
     /**
      * Air-filtered cube of side {@code 2*CAPTURE_GRID_RADIUS+1} around the
-     * floored player feet. Each entry is {@code [block_id, dx, dy, dz]} — a
-     * compact array, not a map, since there can be hundreds-to-thousands per
-     * tick. Cells in unloaded chunks read as air and drop out (chunks within
+     * floored player feet, palette-encoded into {@code entry}:
+     * <ul>
+     *   <li>{@code block_palette} — the distinct block ids in this row, in
+     *       first-seen order.</li>
+     *   <li>{@code block_grid} — one {@code [palette_idx, dx, dy, dz]} per
+     *       non-air cell.</li>
+     * </ul>
+     * The palette collapses the heavy id-string repetition (one
+     * {@code "minecraft:stone"} per row instead of thousands), so both the
+     * serialized size and the per-cell work shrink: blocks are singletons, so
+     * an {@link IdentityHashMap} dedupes them and {@code getKey().toString()}
+     * runs once per distinct block, not once per cell.
+     *
+     * <p>Cells in unloaded chunks read as air and drop out (chunks within
      * radius 10 of the player are always loaded in practice).
      */
-    private static List<Object> buildBlockGrid(ClientLevel level, int ox, int oy, int oz) {
+    private static void addBlockGrid(Map<String, Object> entry, ClientLevel level, int ox, int oy, int oz) {
+        List<Object> palette = new ArrayList<>();
+        Map<Block, Integer> paletteIndex = new IdentityHashMap<>();
         List<Object> blocks = new ArrayList<>();
         BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
         int r = CAPTURE_GRID_RADIUS;
@@ -144,8 +159,15 @@ public final class TickSidecarRecorder {
                     cursor.set(ox + dx, oy + dy, oz + dz);
                     BlockState bs = level.getBlockState(cursor);
                     if (bs.isAir()) continue;
+                    Block block = bs.getBlock();
+                    Integer idx = paletteIndex.get(block);
+                    if (idx == null) {
+                        idx = palette.size();
+                        paletteIndex.put(block, idx);
+                        palette.add(BuiltInRegistries.BLOCK.getKey(block).toString());
+                    }
                     List<Object> rec = new ArrayList<>(4);
-                    rec.add(BuiltInRegistries.BLOCK.getKey(bs.getBlock()).toString());
+                    rec.add(idx);
                     rec.add(dx);
                     rec.add(dy);
                     rec.add(dz);
@@ -153,7 +175,8 @@ public final class TickSidecarRecorder {
                 }
             }
         }
-        return blocks;
+        entry.put("block_palette", palette);
+        entry.put("block_grid", blocks);
     }
 
     /**
