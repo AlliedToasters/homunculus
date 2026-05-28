@@ -68,6 +68,7 @@ public final class WaterAversionHandler implements HttpHandler {
         body.put("success", true);
         body.put("armed", s.armed());
         body.put("fired", s.fired());
+        body.put("fired_at_ms", s.firedAtMs() == 0L ? null : s.firedAtMs());
         if (s.submergedPos() != null) {
             double[] p = s.submergedPos();
             body.put("submerged_pos", List.of(p[0], p[1], p[2]));

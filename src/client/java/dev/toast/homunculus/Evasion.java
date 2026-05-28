@@ -50,6 +50,13 @@ public final class Evasion {
 
     private volatile boolean armed = false;
     private volatile boolean fired = false;
+    // Epoch-ms of the first-fire edge (System.currentTimeMillis at the tick
+    // where `fired` flipped false→true), or 0L when not fired. Re-arm clears
+    // it so a stale fire from a prior arm window can't leak into the next.
+    // Exposed on /evasion/status as `fired_at_ms`; the Python rollout loop
+    // copies it into the per-turn JSONL so post-hoc replay can locate the
+    // reflex within the turn (plan/exec/ctx phase ribbon).
+    private volatile long firedAtMs = 0L;
     private volatile double[] anchor;          // [x, y, z]
     private final Set<String> attackers = new LinkedHashSet<>();
     private volatile FleeState fleeState = FleeState.IDLE;
@@ -74,6 +81,7 @@ public final class Evasion {
     public synchronized void arm(double[] anchor) {
         this.anchor = anchor == null ? null : anchor.clone();
         this.fired = false;
+        this.firedAtMs = 0L;
         this.attackers.clear();
         this.fleeState = FleeState.IDLE;
         this.fleeStartedMs = 0L;
@@ -86,6 +94,7 @@ public final class Evasion {
     public synchronized void disarm() {
         this.armed = false;
         this.fired = false;
+        this.firedAtMs = 0L;
         this.anchor = null;
         this.attackers.clear();
         this.fleeState = FleeState.IDLE;
@@ -98,6 +107,7 @@ public final class Evasion {
         return new Snapshot(
                 armed,
                 fired,
+                firedAtMs,
                 anchor == null ? null : anchor.clone(),
                 List.copyOf(attackers),
                 fleeState,
@@ -133,6 +143,7 @@ public final class Evasion {
                     if (armed && !fired) {
                         attackers.add(attackerId);
                         fired = true;
+                        firedAtMs = System.currentTimeMillis();
                         shouldKick = true;
                     } else if (armed) {
                         // Already fired this arm window; just record the additional attacker.
@@ -231,8 +242,9 @@ public final class Evasion {
         return m == null ? c.getClass().getSimpleName() : m;
     }
 
-    /** Immutable snapshot returned to {@code /evasion/status}. */
-    public record Snapshot(boolean armed, boolean fired, double[] anchor,
+    /** Immutable snapshot returned to {@code /evasion/status}.
+     *  {@code firedAtMs} is epoch-ms at the first-fire edge (0L when not fired). */
+    public record Snapshot(boolean armed, boolean fired, long firedAtMs, double[] anchor,
                            List<String> attackers, FleeState fleeState,
                            String fleeFailureReason) {}
 }

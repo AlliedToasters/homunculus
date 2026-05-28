@@ -106,6 +106,9 @@ public final class EvasionHandler implements HttpHandler {
         body.put("success", true);
         body.put("armed", s.armed());
         body.put("fired", s.fired());
+        // 0L means "not fired this arm window"; we surface null in that case
+        // so consumers can `is None`-test rather than guarding on a sentinel.
+        body.put("fired_at_ms", s.firedAtMs() == 0L ? null : s.firedAtMs());
         if (s.anchor() != null) {
             double[] a = s.anchor();
             body.put("anchor", List.of(a[0], a[1], a[2]));

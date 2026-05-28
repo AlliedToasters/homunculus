@@ -44,6 +44,8 @@ public final class WaterAversion {
 
     private volatile boolean armed = false;
     private volatile boolean fired = false;
+    // Epoch-ms of the fire edge (see Evasion.firedAtMs for rationale).
+    private volatile long firedAtMs = 0L;
     private volatile double[] submergedPos;   // [x, y, z] at fire moment
     private volatile int[] dryLandPos;        // [x, y, z] picked by findDryLand
     private volatile FleeState fleeState = FleeState.IDLE;
@@ -60,6 +62,7 @@ public final class WaterAversion {
      *  cancel an in-progress flee (the player keeps walking to dry land). */
     public synchronized void arm() {
         this.fired = false;
+        this.firedAtMs = 0L;
         this.submergedPos = null;
         this.dryLandPos = null;
         this.fleeState = FleeState.IDLE;
@@ -71,6 +74,7 @@ public final class WaterAversion {
     public synchronized void disarm() {
         this.armed = false;
         this.fired = false;
+        this.firedAtMs = 0L;
         this.submergedPos = null;
         this.dryLandPos = null;
         this.fleeState = FleeState.IDLE;
@@ -82,6 +86,7 @@ public final class WaterAversion {
         return new Snapshot(
                 armed,
                 fired,
+                firedAtMs,
                 submergedPos == null ? null : submergedPos.clone(),
                 dryLandPos == null ? null : dryLandPos.clone(),
                 fleeState,
@@ -102,6 +107,7 @@ public final class WaterAversion {
                     if (armed && !fired) {
                         submergedPos = new double[] { player.getX(), player.getY(), player.getZ() };
                         fired = true;
+                        firedAtMs = System.currentTimeMillis();
                         shouldKick = true;
                     } else {
                         shouldKick = false;
@@ -227,7 +233,7 @@ public final class WaterAversion {
         return m == null ? c.getClass().getSimpleName() : m;
     }
 
-    public record Snapshot(boolean armed, boolean fired, double[] submergedPos,
-                           int[] dryLandPos, FleeState fleeState,
+    public record Snapshot(boolean armed, boolean fired, long firedAtMs,
+                           double[] submergedPos, int[] dryLandPos, FleeState fleeState,
                            String fleeFailureReason) {}
 }
