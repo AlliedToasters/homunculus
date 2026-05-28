@@ -82,12 +82,33 @@ public abstract class OutboundPacketMixin {
                 && PacketAllowlist.SPATIAL_PLAY.contains(idStr)) {
             PacketRecorder.INSTANCE.record(packet, idStr, System.currentTimeMillis());
         }
-        // Live codec passthrough is also independent of round-trip: when
-        // armed, fields are shipped to the Python codec server async. Never
-        // affects what goes on the wire.
+        // Live codec passthrough — two modes:
+        //   1. observer (default): async, never affects the wire.
+        //   2. substitute (smoke test): sync round-trip via the Python codec
+        //      server, reconstruct packet from decoded fields, send the
+        //      clone in place of the original. Falls back to the original
+        //      packet on any failure (transport error, unsupported type,
+        //      reconstructor error).
         if (idStr != null && CodecPassthrough.INSTANCE.isArmed()
                 && PacketAllowlist.SPATIAL_PLAY.contains(idStr)) {
-            CodecPassthrough.INSTANCE.observe(packet, idStr, System.currentTimeMillis());
+            if (CodecPassthrough.INSTANCE.isSubstituteMode()) {
+                Packet<?> subClone = CodecPassthrough.INSTANCE.trySubstitute(
+                        packet, idStr, System.currentTimeMillis());
+                if (subClone != null) {
+                    Connection sub = (Connection) (Object) this;
+                    ROUNDTRIPPING.set(true);
+                    try {
+                        sub.send(subClone, listener, flush);
+                    } finally {
+                        ROUNDTRIPPING.set(false);
+                    }
+                    ci.cancel();
+                    return;
+                }
+                // null → fall through to original packet (pass-through path)
+            } else {
+                CodecPassthrough.INSTANCE.observe(packet, idStr, System.currentTimeMillis());
+            }
         }
 
         if (!PacketRoundtrip.INSTANCE.isEnabled()) return;

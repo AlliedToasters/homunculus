@@ -73,7 +73,20 @@ public final class CodecPassthrough {
     // compared to the actual packet id and counted in predictedCorrect /
     // predictedTotal. Does not affect the wire — purely observational.
     private volatile String inferenceUrl = null;
+    // When true, the codec round-trip happens SYNCHRONOUSLY on the network
+    // thread (not via the async worker) and the codec's decoded fields are
+    // reconstructed into a packet that goes on the wire instead of the
+    // original. Smoke-test scope (ml.MD §4a step 2, interpretation A): only
+    // ServerboundMovePlayerPacket is reconstructable today. For types without
+    // a reconstructor we fall back to pass-through.
+    private volatile boolean substitute = false;
     private volatile long armedAtMs = 0L;
+
+    // Shared sync HTTP client for substitute=true path (separate from the
+    // async worker's client to avoid threading questions).
+    private final HttpClient syncHttp = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofMillis(REQUEST_TIMEOUT_MS))
+            .build();
 
     private final Object lifecycleLock = new Object();
     private LinkedBlockingQueue<Task> queue;
@@ -89,6 +102,10 @@ public final class CodecPassthrough {
     // Inference prediction counters (only meaningful when inferenceUrl is set).
     private final AtomicLong predictedTotal = new AtomicLong();
     private final AtomicLong predictedCorrect = new AtomicLong();
+    // Substitution counters (only meaningful when substitute is true).
+    private final AtomicLong substituted = new AtomicLong();
+    private final AtomicLong substituteFallbacks = new AtomicLong();
+    private final AtomicLong substituteErrors = new AtomicLong();
 
     // Per-packet-type drift log counters — capped so a broken codec doesn't
     // flood logs. Created lazily because the set of ids is small.
@@ -111,7 +128,7 @@ public final class CodecPassthrough {
      *                      packet's obs is also sent to this endpoint and the
      *                      predicted_type is compared to the actual packet id.
      */
-    public Map<String, Object> arm(String endpointUrl, String inferenceUrl) {
+    public Map<String, Object> arm(String endpointUrl, String inferenceUrl, boolean substitute) {
         if (endpointUrl == null || endpointUrl.isBlank()) {
             throw new IllegalArgumentException("endpoint must be a non-empty URL");
         }
@@ -130,6 +147,7 @@ public final class CodecPassthrough {
             this.workerThread = t;
             this.endpoint = endpointUrl;
             this.inferenceUrl = (inferenceUrl != null && !inferenceUrl.isBlank()) ? inferenceUrl : null;
+            this.substitute = substitute;
             this.armedAtMs = System.currentTimeMillis();
             attempted.set(0);
             ok.set(0);
@@ -139,17 +157,30 @@ public final class CodecPassthrough {
             noObs.set(0);
             predictedTotal.set(0);
             predictedCorrect.set(0);
+            substituted.set(0);
+            substituteFallbacks.set(0);
+            substituteErrors.set(0);
             driftLogCounts.clear();
             armed = true;
             t.start();
-            HomunculusClient.LOGGER.info("[codec-passthrough] armed → {} (inference: {})",
-                    endpointUrl, this.inferenceUrl != null ? this.inferenceUrl : "none");
+            HomunculusClient.LOGGER.info("[codec-passthrough] armed → {} (inference: {}, substitute: {})",
+                    endpointUrl,
+                    this.inferenceUrl != null ? this.inferenceUrl : "none",
+                    this.substitute);
             return snapshot();
         }
     }
 
+    public Map<String, Object> arm(String endpointUrl, String inferenceUrl) {
+        return arm(endpointUrl, inferenceUrl, false);
+    }
+
     public Map<String, Object> arm(String endpointUrl) {
-        return arm(endpointUrl, null);
+        return arm(endpointUrl, null, false);
+    }
+
+    public boolean isSubstituteMode() {
+        return armed && substitute;
     }
 
     public Map<String, Object> disarm() {
@@ -169,6 +200,9 @@ public final class CodecPassthrough {
             m.put("no_obs", noObs.get());
             m.put("predicted_total", predictedTotal.get());
             m.put("predicted_correct", predictedCorrect.get());
+            m.put("substituted", substituted.get());
+            m.put("substitute_fallbacks", substituteFallbacks.get());
+            m.put("substitute_errors", substituteErrors.get());
             return m;
         }
     }
@@ -200,6 +234,95 @@ public final class CodecPassthrough {
         }
     }
 
+    /**
+     * Synchronous substitute path. Called from the mixin BEFORE the original
+     * packet is sent, on the network thread. Returns the clone to substitute
+     * (caller cancels the original and sends the clone), or {@code null} to
+     * pass the original through unchanged.
+     *
+     * <p>Increments counters:
+     * <ul>
+     *   <li>{@link #substituted} on successful substitution
+     *   <li>{@link #substituteFallbacks} when the packet type has no
+     *       reconstructor (deliberate, not an error)
+     *   <li>{@link #substituteErrors} on codec round-trip failure or
+     *       transport error (logged at debug; falls back to original)
+     * </ul>
+     */
+    public Packet<?> trySubstitute(Packet<?> packet, String packetId, long tsMs) {
+        if (!armed || !substitute) return null;
+        if (!PacketReconstructor.canReconstruct(packetId)) {
+            substituteFallbacks.incrementAndGet();
+            return null;
+        }
+        PlayerObsSnapshot.Snapshot obs = PlayerObsSnapshot.latest();
+        if (obs == null) {
+            noObs.incrementAndGet();
+            return null;
+        }
+        attempted.incrementAndGet();
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("id", packetId);
+        body.put("fields", PacketFieldExtractor.extract(packet));
+        body.put("obs", obs.toJson());
+        body.put("ts_ms", tsMs);
+        String json = Json.write(body);
+
+        try {
+            URI uri = URI.create(endpoint);
+            HttpRequest req = HttpRequest.newBuilder(uri)
+                    .timeout(Duration.ofMillis(REQUEST_TIMEOUT_MS))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(json, StandardCharsets.UTF_8))
+                    .build();
+            HttpResponse<String> resp = syncHttp.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (resp.statusCode() / 100 != 2) {
+                substituteErrors.incrementAndGet();
+                logBounded(packetId, "substitute non-2xx " + resp.statusCode());
+                return null;
+            }
+            Object parsed = Json.parse(resp.body());
+            if (!(parsed instanceof Map<?, ?> m)) {
+                substituteErrors.incrementAndGet();
+                return null;
+            }
+            if (!Boolean.TRUE.equals(m.get("ok"))) {
+                drift.incrementAndGet();
+                Object err = m.get("error");
+                logBounded(packetId, "substitute drift: " + err);
+                return null;
+            }
+            Object decodedRaw = m.get("decoded");
+            if (!(decodedRaw instanceof Map<?, ?>)) {
+                substituteErrors.incrementAndGet();
+                logBounded(packetId, "substitute no decoded fields in response");
+                return null;
+            }
+            @SuppressWarnings("unchecked")
+            Map<String, Object> decoded = (Map<String, Object>) decodedRaw;
+            Packet<?> clone = PacketReconstructor.build(packetId, decoded);
+            if (clone == null) {
+                substituteErrors.incrementAndGet();
+                logBounded(packetId, "substitute reconstructor returned null");
+                return null;
+            }
+            ok.incrementAndGet();
+            substituted.incrementAndGet();
+            return clone;
+        } catch (IOException | InterruptedException e) {
+            substituteErrors.incrementAndGet();
+            transportErrors.incrementAndGet();
+            logBounded(packetId, "substitute transport: " + e);
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+            return null;
+        } catch (Throwable t) {
+            substituteErrors.incrementAndGet();
+            logBounded(packetId, "substitute unexpected: " + t);
+            return null;
+        }
+    }
+
     public Map<String, Object> snapshot() {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("success", true);
@@ -217,6 +340,10 @@ public final class CodecPassthrough {
         if (predictedTotal.get() > 0) {
             m.put("predicted_accuracy", (double) predictedCorrect.get() / predictedTotal.get());
         }
+        m.put("substitute_mode", substitute);
+        m.put("substituted", substituted.get());
+        m.put("substitute_fallbacks", substituteFallbacks.get());
+        m.put("substitute_errors", substituteErrors.get());
         return m;
     }
 

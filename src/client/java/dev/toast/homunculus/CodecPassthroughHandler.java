@@ -59,6 +59,7 @@ public final class CodecPassthroughHandler implements HttpHandler {
     private void handleArm(HttpExchange exchange) throws IOException {
         String endpoint;
         String inferenceUrl = null;
+        boolean substitute = false;
         try {
             byte[] bytes = exchange.getRequestBody().readNBytes(MAX_BODY_BYTES + 1);
             if (bytes.length > MAX_BODY_BYTES) {
@@ -86,12 +87,20 @@ public final class CodecPassthroughHandler implements HttpHandler {
             if (iv instanceof String is && !is.isBlank()) {
                 inferenceUrl = is;
             }
+            // substitute is optional (default false) — when true, the codec
+            // server's decoded fields are reconstructed into a packet that
+            // goes on the wire instead of the original. Only the move family
+            // is reconstructable today; other types fall back to pass-through.
+            Object sv = map.get("substitute");
+            if (sv instanceof Boolean sb) {
+                substitute = sb;
+            }
         } catch (Exception e) {
             respond(exchange, 400, failure("bad_request", "bad json: " + rootMessage(e)));
             return;
         }
         try {
-            respond(exchange, 200, CodecPassthrough.INSTANCE.arm(endpoint, inferenceUrl));
+            respond(exchange, 200, CodecPassthrough.INSTANCE.arm(endpoint, inferenceUrl, substitute));
         } catch (Exception e) {
             respond(exchange, 500, failure("internal_error", "arm failed: " + rootMessage(e)));
         }
