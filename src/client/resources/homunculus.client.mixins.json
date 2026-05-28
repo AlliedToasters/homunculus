@@ -6,7 +6,9 @@
 	"plugin": "dev.toast.homunculus.mixin.HomunculusMixinPlugin",
 	"client": [
 		"WurstIngameHudMixin",
-		"GuiHudMixin"
+		"GuiHudMixin",
+		"OutboundPacketMixin",
+		"PacketEncoderAccessor"
 	],
 	"injectors": {
 		"defaultRequire": 1

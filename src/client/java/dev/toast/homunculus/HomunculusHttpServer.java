@@ -52,6 +52,17 @@ public final class HomunculusHttpServer {
 		server.createContext("/smelt_status", new SmeltStatusHandler());
 		server.createContext("/collect_smelt", new CollectSmeltHandler());
 		server.createContext("/deaths", new DeathsHandler());
+		// Phase 0 of the codec experiment (ml.MD §4a): outbound packet tap.
+		// HEAD-only mixin into Connection.sendPacket counts every serverbound
+		// packet by class + keeps a small ring buffer for spot-checking.
+		// No mutation surface yet; Phase 1 will add encode/decode substitution
+		// at the same seam, gated on a kill switch.
+		PacketsHandler packetsHandler = new PacketsHandler();
+		server.createContext("/packets/stats", packetsHandler);
+		server.createContext("/packets/recent", packetsHandler);
+		// Phase 1: byte round-trip kill switch + counters. POST {"enabled":bool}
+		// flips the global flag; the mixin checks it per outbound packet.
+		server.createContext("/packets/roundtrip", new PacketRoundtripHandler());
 		server.createContext("/debug/door_courtesy", new DoorCourtesyDebugHandler());
 		// Reflexive evasion — one handler, three paths. Python arms once per turn,
 		// optionally polls /status mid-turn, disarms at end. The watcher itself
