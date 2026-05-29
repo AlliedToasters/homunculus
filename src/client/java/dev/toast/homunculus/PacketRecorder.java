@@ -84,12 +84,18 @@ public final class PacketRecorder {
             }
             Path target = resolvePath(pathOrNull);
             Files.createDirectories(target.getParent());
+            // TRUNCATE on arm (not APPEND): arming a recorder means a *fresh*
+            // recording. APPEND silently prepended a prior run's packets when a
+            // capture dir was reused — and since TICK_COUNTER is cumulative
+            // across client life, the stale lines were monotonic and invisible
+            // to a tick-sort, only surfacing as a broken packet↔sidecar join.
+            // Matches the gzip sidecar (TickSidecarRecorder), which truncates.
             BufferedWriter w = Files.newBufferedWriter(
                     target,
                     StandardCharsets.UTF_8,
                     StandardOpenOption.CREATE,
                     StandardOpenOption.WRITE,
-                    StandardOpenOption.APPEND);
+                    StandardOpenOption.TRUNCATE_EXISTING);
             LinkedBlockingQueue<String> q = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
             Thread t = new Thread(() -> drain(w, q), "homunculus-packet-recorder");
             t.setDaemon(true);

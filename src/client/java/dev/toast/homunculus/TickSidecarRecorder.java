@@ -235,12 +235,16 @@ public final class TickSidecarRecorder {
             }
             Path target = resolvePath(pathOrNull, gzip);
             Files.createDirectories(target.getParent());
+            // TRUNCATE on arm (not APPEND): the gzip path (newGzipWriter) already
+            // truncates; the plain path must match so "arm" means a fresh file on
+            // either branch. APPEND-on-arm prepended a prior run's rows on dir
+            // reuse (see the PacketRecorder note).
             BufferedWriter w = gzip ? newGzipWriter(target) : Files.newBufferedWriter(
                     target,
                     StandardCharsets.UTF_8,
                     StandardOpenOption.CREATE,
                     StandardOpenOption.WRITE,
-                    StandardOpenOption.APPEND);
+                    StandardOpenOption.TRUNCATE_EXISTING);
             this.gzip = gzip;
             LinkedBlockingQueue<Map<String, Object>> q = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
             Thread t = new Thread(() -> drain(w, q), "homunculus-tick-sidecar");
