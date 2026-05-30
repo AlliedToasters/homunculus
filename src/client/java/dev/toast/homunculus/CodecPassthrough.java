@@ -23,12 +23,19 @@ import java.util.concurrent.atomic.AtomicLong;
  * train and inference); this class is the bridge that exercises it on live
  * gameplay traffic.
  *
- * <p>Important non-goal: this does NOT substitute the codec's output for the
- * original packet. The seam where bytes hit the wire is unchanged. Step 2 is
- * "is the codec identity in practice at live data rate?"; substituting bytes
- * needs Java-side per-packet reconstruction and is a separate lift. If drift
- * counters stay at zero across a real rollout, that substitution becomes a
- * mechanical follow-up rather than a risk.
+ * <p>Two modes (selected at arm-time via the {@code substitute} flag):
+ * <ul>
+ *   <li><b>observer</b> (default): async round-trip, the wire is unchanged.
+ *       Answers "is the codec identity in practice at live data rate?" via the
+ *       drift counter. Safe to run on a real rollout with zero behavioral risk.
+ *   <li><b>substitute</b>: synchronous round-trip on the network thread, and
+ *       the codec's decoded fields are reconstructed into a packet that goes on
+ *       the wire <i>in place of</i> the original (see {@link #trySubstitute}).
+ *       This is the end-to-end codec-in-the-loop test: the controller plays
+ *       through the codec. All allowlisted SPATIAL_PLAY types reconstruct
+ *       ({@link PacketReconstructor#canReconstruct}); a type without a
+ *       reconstructor falls back to pass-through.
+ * </ul>
  *
  * <p>Lifecycle mirrors {@link PacketRecorder}: arm with an endpoint URL → a
  * bounded queue accepts (packet-id, fields, obs) triples from the network
@@ -58,6 +65,14 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class CodecPassthrough {
 
+    // Substitute-latency histogram bucket upper bounds in micros:
+    // 1,2,5,10,20,50,100,200,500ms, then +inf. MUST be declared before INSTANCE
+    // below — the instance field substLatHist sizes itself from this in the
+    // constructor, so static-init order matters (a NoClassDefFoundError /
+    // NPE-in-<clinit> results if this initializes after INSTANCE).
+    private static final long[] LAT_BUCKETS_US = {
+            1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000, 500_000, Long.MAX_VALUE};
+
     public static final CodecPassthrough INSTANCE = new CodecPassthrough();
 
     private static final int QUEUE_CAPACITY = 4096;
@@ -76,9 +91,10 @@ public final class CodecPassthrough {
     // When true, the codec round-trip happens SYNCHRONOUSLY on the network
     // thread (not via the async worker) and the codec's decoded fields are
     // reconstructed into a packet that goes on the wire instead of the
-    // original. Smoke-test scope (ml.MD §4a step 2, interpretation A): only
-    // ServerboundMovePlayerPacket is reconstructable today. For types without
-    // a reconstructor we fall back to pass-through.
+    // original. All allowlisted SPATIAL_PLAY types reconstruct today (the 4
+    // move subtypes, player_input, player_command, use_item, use_item_on,
+    // player_action, interact, swing — see PacketReconstructor.canReconstruct).
+    // A type without a reconstructor falls back to pass-through.
     private volatile boolean substitute = false;
     private volatile long armedAtMs = 0L;
 
@@ -106,6 +122,20 @@ public final class CodecPassthrough {
     private final AtomicLong substituted = new AtomicLong();
     private final AtomicLong substituteFallbacks = new AtomicLong();
     private final AtomicLong substituteErrors = new AtomicLong();
+
+    // Substitute round-trip latency (the synchronous POST on the netty send
+    // thread — the feasibility signal: this is added inline at 20Hz). Timed in
+    // microseconds. Mean = sum/count; max via CAS; p99 from a coarse fixed
+    // histogram (bucket-resolution, enough for a desync canary). Recorded on
+    // every send attempt that returns or throws — success and transport error
+    // alike, since latency matters regardless of outcome.
+    private final AtomicLong substLatCount = new AtomicLong();
+    private final AtomicLong substLatSumMicros = new AtomicLong();
+    private final AtomicLong substLatMaxMicros = new AtomicLong();
+    // Histogram buckets (LAT_BUCKETS_US) are declared at the top of the class,
+    // before INSTANCE, so this field can size itself in the constructor.
+    private final java.util.concurrent.atomic.AtomicLongArray substLatHist =
+            new java.util.concurrent.atomic.AtomicLongArray(LAT_BUCKETS_US.length);
 
     // Per-packet-type drift log counters — capped so a broken codec doesn't
     // flood logs. Created lazily because the set of ids is small.
@@ -160,6 +190,10 @@ public final class CodecPassthrough {
             substituted.set(0);
             substituteFallbacks.set(0);
             substituteErrors.set(0);
+            substLatCount.set(0);
+            substLatSumMicros.set(0);
+            substLatMaxMicros.set(0);
+            for (int i = 0; i < substLatHist.length(); i++) substLatHist.set(i, 0);
             driftLogCounts.clear();
             armed = true;
             t.start();
@@ -276,7 +310,13 @@ public final class CodecPassthrough {
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(json, StandardCharsets.UTF_8))
                     .build();
-            HttpResponse<String> resp = syncHttp.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            long sendStartNs = System.nanoTime();
+            HttpResponse<String> resp;
+            try {
+                resp = syncHttp.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            } finally {
+                recordSubstLatency(System.nanoTime() - sendStartNs);
+            }
             if (resp.statusCode() / 100 != 2) {
                 substituteErrors.incrementAndGet();
                 logBounded(packetId, "substitute non-2xx " + resp.statusCode());
@@ -344,7 +384,60 @@ public final class CodecPassthrough {
         m.put("substituted", substituted.get());
         m.put("substitute_fallbacks", substituteFallbacks.get());
         m.put("substitute_errors", substituteErrors.get());
+        long latN = substLatCount.get();
+        m.put("subst_latency_count", latN);
+        if (latN > 0) {
+            m.put("subst_latency_mean_ms", (substLatSumMicros.get() / (double) latN) / 1000.0);
+            m.put("subst_latency_max_ms", substLatMaxMicros.get() / 1000.0);
+            m.put("subst_latency_p99_ms", percentileMs(0.99));
+            m.put("subst_latency_p50_ms", percentileMs(0.50));
+        }
         return m;
+    }
+
+    /**
+     * Record one substitute-send wall-time. Lock-free: bumps count, sum, a
+     * CAS-max, and the matching histogram bucket. Called on the netty send
+     * thread, so it must stay cheap (a few atomics).
+     */
+    private void recordSubstLatency(long nanos) {
+        long micros = nanos / 1000;
+        substLatCount.incrementAndGet();
+        substLatSumMicros.addAndGet(micros);
+        long prevMax;
+        while (micros > (prevMax = substLatMaxMicros.get())) {
+            if (substLatMaxMicros.compareAndSet(prevMax, micros)) break;
+        }
+        for (int i = 0; i < LAT_BUCKETS_US.length; i++) {
+            if (micros <= LAT_BUCKETS_US[i]) {
+                substLatHist.incrementAndGet(i);
+                break;
+            }
+        }
+    }
+
+    /**
+     * Approximate percentile (in ms) from the coarse histogram. Resolution is
+     * the bucket width; returns the upper edge of the bucket the target rank
+     * falls in (the open top bucket reports its lower edge as a floor).
+     */
+    private double percentileMs(double q) {
+        long total = substLatCount.get();
+        if (total == 0) return 0.0;
+        long target = (long) Math.ceil(q * total);
+        long cum = 0;
+        for (int i = 0; i < LAT_BUCKETS_US.length; i++) {
+            cum += substLatHist.get(i);
+            if (cum >= target) {
+                long edge = LAT_BUCKETS_US[i];
+                if (edge == Long.MAX_VALUE) {
+                    // open top bucket: floor at the previous edge, can't bound above.
+                    return i > 0 ? LAT_BUCKETS_US[i - 1] / 1000.0 : 0.0;
+                }
+                return edge / 1000.0;
+            }
+        }
+        return substLatMaxMicros.get() / 1000.0;
     }
 
     private void drain(LinkedBlockingQueue<Task> q, HttpClient client) {

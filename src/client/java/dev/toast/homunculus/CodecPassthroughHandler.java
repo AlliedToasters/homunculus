@@ -89,8 +89,9 @@ public final class CodecPassthroughHandler implements HttpHandler {
             }
             // substitute is optional (default false) — when true, the codec
             // server's decoded fields are reconstructed into a packet that
-            // goes on the wire instead of the original. Only the move family
-            // is reconstructable today; other types fall back to pass-through.
+            // goes on the wire instead of the original. All allowlisted
+            // SPATIAL_PLAY types are reconstructable; any type without a
+            // reconstructor falls back to pass-through.
             Object sv = map.get("substitute");
             if (sv instanceof Boolean sb) {
                 substitute = sb;
