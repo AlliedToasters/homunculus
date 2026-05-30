@@ -42,6 +42,10 @@ public final class HomunculusHttpServer {
 		server.createContext("/bed/place", new BedPlaceHandler());
 		server.createContext("/bed/sleep", new SleepHandler());
 		server.createContext("/shear/sheep", new ShearHandler());
+		// /attack_entity: melee-attack one entity chosen by UUID (from /scan_entities).
+		// Injection path for the neural target-selector (neural_interface.md §13.1) —
+		// rotate + gameMode.attack + swing the chosen target; no KillAura auto-aim needed.
+		server.createContext("/attack_entity", new AttackEntityHandler());
 		server.createContext("/place", new PlaceHandler());
 		server.createContext("/place_at", new PlaceAtHandler());
 		server.createContext("/equip", new EquipHandler());
