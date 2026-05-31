@@ -1,5 +1,7 @@
 package dev.toast.homunculus;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonPrimitive;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
@@ -80,6 +82,7 @@ public final class PlayerObsSnapshot {
             boolean onGround,
             String dim,
             List<Map<String, Object>> entitySet,
+            Map<String, Object> policy,
             Map<String, Object> extras
     ) {
         /** Minimal codec-facing obs (round-trip reference frame) + the bounded
@@ -97,6 +100,10 @@ public final class PlayerObsSnapshot {
             m.put("on_ground", onGround);
             m.put("dim", dim);
             m.put("entity_set", entitySet == null ? List.of() : entitySet);
+            // g_t: the active executor policy (Wurst KillAura filter stack +
+            // Priority). The §18.1 conditioning variable the codec reads off the
+            // wire to predict the interact target across filter modes.
+            m.put("policy", policy == null ? Map.of() : policy);
             return m;
         }
 
@@ -135,6 +142,7 @@ public final class PlayerObsSnapshot {
                     p.onGround(),
                     dim == null ? null : dim.toString(),
                     buildEntitySet(p),
+                    buildPolicy(),
                     buildExtras(p, tick)
             ));
         });
@@ -204,6 +212,42 @@ public final class PlayerObsSnapshot {
             out.add(rec);
         }
         return out;
+    }
+
+    /**
+     * The active executor policy (g_t) for the codec obs (§18.1): KillAura's
+     * target-selection settings — {@code Priority}, {@code Range}, and every
+     * {@code "Filter ..."} toggle — read via the Wurst reflection API on the
+     * client thread (cheap field reads, on the same tick budget as entity_set).
+     * Keys are the Wurst setting display names; values are boolean / number /
+     * string. Empty if Wurst or KillAura is absent. This is the conditioning
+     * variable the interact codec reads off the wire to predict the attack
+     * target across filter modes (same scene, different target by policy).
+     */
+    private static Map<String, Object> buildPolicy() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        if (!Wurst.isApiLoaded() || !Wurst.isSettingApiReady()) return out;
+        Object hack = Wurst.findHack("KillAura");
+        if (hack == null) return out;
+        for (Object setting : Wurst.getSettingsMap(hack).values()) {
+            String name = Wurst.settingName(setting);
+            if (name == null) continue;
+            if (!(name.startsWith("Filter") || name.equals("Priority") || name.equals("Range"))) {
+                continue;
+            }
+            Object val = jsonToValue(Wurst.settingToJson(setting));
+            if (val != null) out.put(name, val);
+        }
+        return out;
+    }
+
+    /** Setting.toJson() JsonElement → a plain JSON value for the obs map. */
+    private static Object jsonToValue(JsonElement el) {
+        if (el == null || el.isJsonNull() || !el.isJsonPrimitive()) return null;
+        JsonPrimitive p = el.getAsJsonPrimitive();
+        if (p.isBoolean()) return p.getAsBoolean();
+        if (p.isNumber()) return p.getAsDouble();
+        return p.getAsString();
     }
 
     private static Map<String, Object> buildInventory(Inventory inv) {

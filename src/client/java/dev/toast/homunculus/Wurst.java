@@ -190,6 +190,20 @@ public final class Wurst {
         }
     }
 
+    /** All settings of a hack as a name→Setting map (Wurst's Feature.getSettings,
+     *  an ordered map). Empty if the API isn't ready / the hack is null. Used by
+     *  PlayerObsSnapshot to expose the active policy (g_t) in the codec obs. */
+    @SuppressWarnings("unchecked")
+    public static Map<String, Object> getSettingsMap(Object hack) {
+        if (!settingApiReady || hack == null) return java.util.Map.of();
+        try {
+            return (Map<String, Object>) featureGetSettings.invoke(hack);
+        } catch (ReflectiveOperationException e) {
+            HomunculusClient.LOGGER.error("Wurst getSettingsMap failed", e);
+            return java.util.Map.of();
+        }
+    }
+
     public static boolean isItemListSetting(Object setting) {
         return itemListSettingClass != null && itemListSettingClass.isInstance(setting);
     }
