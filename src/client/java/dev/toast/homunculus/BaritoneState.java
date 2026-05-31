@@ -29,6 +29,14 @@ public final class BaritoneState {
 
     private BaritoneState() {}
 
+    /**
+     * Cap on the forward path slice emitted in {@code path_fwd}. A Baritone goto
+     * path can be hundreds of nodes; the §21.0 local window (r≤10) exits within
+     * the first few dozen, so 96 covers it with margin while keeping the per-tick
+     * sidecar row bounded.
+     */
+    private static final int PATH_FWD_MAX = 96;
+
     /** Null if there is no primary baritone yet; otherwise a state map. */
     public static Map<String, Object> snapshot() {
         IBaritone bar;
@@ -86,6 +94,15 @@ public final class BaritoneState {
         m.put("path_dest", null);
         m.put("path_len", null);
         m.put("path_next", null);
+        // §21.0: the forward slice of the planned path from the executor's
+        // current node onward — the local-navigation TARGET source. The
+        // window-exit subgoal (where the path crosses radius r) is computed
+        // offline from this + the player position, so any r is replayable from
+        // one capture. Bounded to PATH_FWD_MAX nodes (a goto path can be
+        // hundreds long; the local window only ever needs the first dozens),
+        // stored absolute (downstream goes egocentric — "nothing absolute").
+        m.put("path_fwd", null);
+        m.put("path_idx", null);
         try {
             if (pb != null) {
                 var op = pb.getPath();   // Optional<IPath>
@@ -102,6 +119,17 @@ public final class BaritoneState {
                     if (positions != null && idx + 1 < positions.size()) {
                         var n = positions.get(idx + 1);
                         m.put("path_next", List.of(n.getX(), n.getY(), n.getZ()));
+                    }
+                    if (positions != null && !positions.isEmpty()) {
+                        m.put("path_idx", idx);
+                        int from = Math.max(0, idx);
+                        int to = Math.min(positions.size(), from + PATH_FWD_MAX);
+                        java.util.List<Object> fwd = new java.util.ArrayList<>(to - from);
+                        for (int i = from; i < to; i++) {
+                            var q = positions.get(i);
+                            fwd.add(List.of(q.getX(), q.getY(), q.getZ()));
+                        }
+                        m.put("path_fwd", fwd);
                     }
                 }
             }
