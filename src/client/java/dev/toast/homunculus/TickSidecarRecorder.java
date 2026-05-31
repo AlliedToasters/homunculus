@@ -125,6 +125,13 @@ public final class TickSidecarRecorder {
         origin.add(oy);
         origin.add(oz);
         entry.put("origin", origin);
+        // Player camera orientation — REQUIRED to anchor a first-person frame to the
+        // world/goal in the §21.2 visual rung: the captured PNG is a view at this yaw,
+        // and the window-exit subgoal target is a world-frame bearing, so without yaw
+        // the frame can't be related to the goal direction. yaw=getYRot (about Y, deg,
+        // 0=+Z/south), pitch=getXRot (deg, +down). Same source as PositionHandler.
+        entry.put("yaw", (double) p.getYRot());
+        entry.put("pitch", (double) p.getXRot());
         entry.put("grid_radius", CAPTURE_GRID_RADIUS);
         entry.put("ent_radius", CAPTURE_ENT_RADIUS);
         addBlockGrid(entry, level, ox, oy, oz);
