@@ -6,6 +6,8 @@ import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.NonNullList;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.food.FoodData;
 import net.minecraft.world.item.ItemStack;
@@ -44,10 +46,28 @@ import java.util.concurrent.atomic.AtomicReference;
  *       plus R2 stats/inventory (§8b) and the control-stack meta-observables
  *       (§8f). This is what {@link PacketRecorder} writes per line.</li>
  * </ul>
- * The heavy R3/R4 channels (block grid, entity set, vision) are NOT here —
- * they go to a separate tick-indexed sidecar (§8e), built in a later phase.
+ * The heavy R4 channels (block grid, vision) are NOT here — they go to a
+ * separate tick-indexed sidecar (§8e). The ONE exception (neural_interface.md
+ * §17.2.2) is a BOUNDED {@code entity_set}: the nearest living entities,
+ * nearest-first (the §13.1 candidate order), each carrying its int network
+ * {@code id} (= the {@code entity_id} field of {@code ServerboundInteract},
+ * resolved by {@code level.getEntity(int)}). This is the substrate the
+ * discrete-target codec needs to reparameterize {@code interact.entity_id} into
+ * an {@code entity_set} index (a pointer into obs, not a raw handle) and is the
+ * gate on §17.2.2. It is captured on the client thread here (where the entity
+ * list is safe to read) and only SERIALIZED on the send thread, so the
+ * latency-sensitive substitute path does no world query — same discipline as
+ * the stats/inventory extras. Bounded (radius {@link #ENTITY_SET_RADIUS},
+ * limit {@link #ENTITY_SET_LIMIT}) so the per-packet obs stays lean.
  */
 public final class PlayerObsSnapshot {
+
+    /** entity_set search half-extent (blocks). Generous vs the ~5-6 attack reach
+     *  so a decoy a few blocks past the target is still observed, but bounded so
+     *  the per-packet obs stays small. */
+    private static final double ENTITY_SET_RADIUS = 16.0;
+    /** Max entities in the obs entity_set (nearest-first cap). */
+    private static final int ENTITY_SET_LIMIT = 16;
 
     public record Snapshot(
             long tickCounter,
@@ -59,9 +79,12 @@ public final class PlayerObsSnapshot {
             double pitch,
             boolean onGround,
             String dim,
+            List<Map<String, Object>> entitySet,
             Map<String, Object> extras
     ) {
-        /** Minimal codec-facing obs (round-trip reference frame). */
+        /** Minimal codec-facing obs (round-trip reference frame) + the bounded
+         *  R3 entity_set (§17.2.2). The entity_set is pre-built on the tick
+         *  thread; this just serializes it. */
         public Map<String, Object> toJson() {
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("tick", tickCounter);
@@ -73,6 +96,7 @@ public final class PlayerObsSnapshot {
             m.put("pitch", pitch);
             m.put("on_ground", onGround);
             m.put("dim", dim);
+            m.put("entity_set", entitySet == null ? List.of() : entitySet);
             return m;
         }
 
@@ -110,6 +134,7 @@ public final class PlayerObsSnapshot {
                     p.getXRot(),
                     p.onGround(),
                     dim == null ? null : dim.toString(),
+                    buildEntitySet(p),
                     buildExtras(p, tick)
             ));
         });
@@ -147,6 +172,38 @@ public final class PlayerObsSnapshot {
         m.putAll(AgentMeta.INSTANCE.read(tick));
 
         return m;
+    }
+
+    /**
+     * Bounded R3 entity_set for the codec-facing obs (§17.2.2). The nearest
+     * living entities (excl. the local player), nearest-first via the shared
+     * {@link Entities#query} highway — the SAME ordering §13.1 used to predict
+     * the attack target. Each record carries the int network {@code id}
+     * ({@code Entity.getId()}), which is exactly the {@code entity_id} the
+     * interact codec must point at; plus type + position + distance so the codec
+     * (and §18) has the geometry to reconstruct the target from obs.
+     *
+     * <p>Client-thread only (reads the live entity list). Cheap, bounded; on the
+     * same tick-thread budget as the stats/inventory extras.
+     */
+    private static List<Map<String, Object>> buildEntitySet(LocalPlayer p) {
+        List<Entity> matched = Entities.query(
+                p, p.level(), ENTITY_SET_RADIUS, e -> e instanceof LivingEntity);
+        List<Map<String, Object>> out = new ArrayList<>(Math.min(matched.size(), ENTITY_SET_LIMIT));
+        for (Entity e : matched) {
+            if (out.size() >= ENTITY_SET_LIMIT) break;
+            Map<String, Object> rec = new LinkedHashMap<>();
+            rec.put("id", e.getId());                 // int network id == interact.entity_id
+            rec.put("type", Entities.typeId(e));
+            List<Object> pos = new ArrayList<>(3);
+            pos.add(e.getX());
+            pos.add(e.getY());
+            pos.add(e.getZ());
+            rec.put("position", pos);
+            rec.put("distance", p.distanceTo(e));
+            out.add(rec);
+        }
+        return out;
     }
 
     private static Map<String, Object> buildInventory(Inventory inv) {
