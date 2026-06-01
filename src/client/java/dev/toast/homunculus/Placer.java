@@ -18,12 +18,15 @@ import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.DoorBlock;
 import net.minecraft.world.level.block.FenceGateBlock;
+import net.minecraft.world.level.block.LeavesBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -65,6 +68,47 @@ public final class Placer {
 			return 3;
 		}
 	}
+
+	/**
+	 * Make-room (Tier 2): when no ready candidate exists at any of {@code feet.y±1},
+	 * pick a candidate whose floor is sturdy but whose cell holds a clearable block,
+	 * Excavate that single cell, and retry. Default on; kill via
+	 * {@code HOMUNCULUS_PLACE_MAKE_ROOM=0} for A/B. Isolated to {@link #place} —
+	 * {@link #placeAt} (shelter/doorway path) never clears, to avoid griefing walls.
+	 */
+	private static final boolean MAKE_ROOM = readMakeRoom();
+	private static final long MAKE_ROOM_TIMEOUT_SECONDS = 20;
+
+	private static boolean readMakeRoom() {
+		String raw = System.getenv("HOMUNCULUS_PLACE_MAKE_ROOM");
+		if (raw == null || raw.isBlank()) return true;
+		String v = raw.trim().toLowerCase(java.util.Locale.ROOT);
+		return !(v.equals("0") || v.equals("false") || v.equals("no"));
+	}
+
+	/**
+	 * Clearable-block allowlist for make-room. Fail-safe: only these solid blocks
+	 * are broken to free a placement cell. Leaves are matched by class (all species).
+	 * Replaceable vegetation (tall grass, ferns, snow layer) is NOT here — those are
+	 * already place-over candidates via {@link #isOpenForPlacement}. Excluded by
+	 * omission: logs (no griefing wood), ores, *any* block with a BlockEntity
+	 * (chests/furnaces never appear in this set), bedrock, obsidian, supports.
+	 */
+	private static final Set<Block> CLEARABLE_TERRAIN = Set.of(
+		Blocks.DIRT, Blocks.GRASS_BLOCK, Blocks.PODZOL, Blocks.COARSE_DIRT,
+		Blocks.ROOTED_DIRT, Blocks.DIRT_PATH, Blocks.MUD, Blocks.CLAY,
+		Blocks.SAND, Blocks.RED_SAND, Blocks.GRAVEL,
+		Blocks.STONE, Blocks.COBBLESTONE, Blocks.ANDESITE, Blocks.DIORITE,
+		Blocks.GRANITE, Blocks.TUFF, Blocks.DEEPSLATE,
+		Blocks.SNOW_BLOCK, Blocks.MOSS_BLOCK, Blocks.CALCITE
+	);
+
+	private static boolean isClearable(Block b) {
+		return b instanceof LeavesBlock || CLEARABLE_TERRAIN.contains(b);
+	}
+
+	/** y offsets searched, in preference order: feet level, one step down, one step up. */
+	private static final int[] Y_OFFSETS = { 0, -1, 1 };
 
 	/** 8 tiles at Chebyshev distance 1 from the player's feet, NESW first then diagonals. */
 	private static final int[][] RING_1 = {
@@ -111,6 +155,32 @@ public final class Placer {
 
 		SearchOutcome outcome = supply(() -> searchAndPrecheck(mc, item, itemIdStr));
 		if (outcome.failure != null) return outcome.failure;
+
+		// Make-room: the search found no ready cell but a clearable one. Excavate
+		// that single cell (Baritone-managed break: pathing/AutoTool/survival
+		// timing + SESSION_LOCK, which /place does not hold) then re-run the
+		// search — the freed cell now qualifies as a Tier-1 spot.
+		if (outcome.clearTarget != null) {
+			BlockPos c = outcome.clearTarget;
+			String clearedBlockId = supply(() ->
+					BuiltInRegistries.BLOCK.getKey(mc.level.getBlockState(c).getBlock()).toString());
+			Excavate.Outcome ex = Excavate.run(
+					c.getX(), c.getY(), c.getZ(), c.getX(), c.getY(), c.getZ(),
+					MAKE_ROOM_TIMEOUT_SECONDS);
+			if (!(ex instanceof Excavate.Cleared)) {
+				return new Failure("make_room_failed",
+						"tried to clear " + clearedBlockId + " at " + c + " to make room but excavate "
+								+ (ex instanceof Excavate.Failed f ? f.reason() + " (" + f.message() + ")" : "did not complete"));
+			}
+			HomunculusClient.LOGGER.info("[place make-room] cleared {} at {} for '{}'", clearedBlockId, c, itemIdStr);
+			outcome = supply(() -> searchAndPrecheck(mc, item, itemIdStr));
+			if (outcome.failure != null) return outcome.failure;
+			if (outcome.target == null) {
+				return new Failure("no_placeable_spot",
+						"cleared a cell at " + c + " but still no placeable spot — relocate and retry");
+			}
+		}
+
 		BlockPos target = outcome.target;
 		BlockPos support = target.below();
 
@@ -232,9 +302,10 @@ public final class Placer {
 		return null;
 	}
 
-	private record SearchOutcome(BlockPos target, Failure failure) {
-		static SearchOutcome ok(BlockPos t) { return new SearchOutcome(t, null); }
-		static SearchOutcome fail(Failure f) { return new SearchOutcome(null, f); }
+	private record SearchOutcome(BlockPos target, BlockPos clearTarget, Failure failure) {
+		static SearchOutcome ok(BlockPos t) { return new SearchOutcome(t, null, null); }
+		static SearchOutcome clear(BlockPos c) { return new SearchOutcome(null, c, null); }
+		static SearchOutcome fail(Failure f) { return new SearchOutcome(null, null, f); }
 	}
 
 	private static SearchOutcome searchAndPrecheck(Minecraft mc, Item item, String itemIdStr) {
@@ -273,26 +344,60 @@ public final class Placer {
 		// which missed doors at the candidate's far side (ring-2 candidates
 		// at offset ±2 can sit 1 cell from a door at offset ±3, which the
 		// old ±2 scan box never saw — shelter doorway repro).
+		// Tier 1: a ready candidate is an open cell with a sturdy floor below.
+		// Scan all same-level candidates first (flat ground ideal), then one step
+		// down (terrace), then one step up — this recovers slope spawns where the
+		// feet-Y neighbours are into-the-hill or over-the-edge.
 		boolean sawDoorAdjacent = false;
-		for (int[] off : SEARCH_ORDER) {
-			BlockPos cand = feet.offset(off[0], 0, off[1]);
-			if (!isOpenForPlacement(level, cand)) continue;
-			if (blocksDoorway(level, cand)) {
-				sawDoorAdjacent = true;
-				continue;
-			}
-			BlockPos below = cand.below();
-			BlockState supportState = level.getBlockState(below);
-			if (supportState.isFaceSturdy(level, below, Direction.UP)) {
-				return SearchOutcome.ok(cand);
+		for (int dy : Y_OFFSETS) {
+			for (int[] off : SEARCH_ORDER) {
+				BlockPos cand = feet.offset(off[0], dy, off[1]);
+				if (!isOpenForPlacement(level, cand)) continue;
+				if (blocksDoorway(level, cand)) {
+					sawDoorAdjacent = true;
+					continue;
+				}
+				BlockPos below = cand.below();
+				BlockState supportState = level.getBlockState(below);
+				if (supportState.isFaceSturdy(level, below, Direction.UP)) {
+					return SearchOutcome.ok(cand);
+				}
 			}
 		}
+
+		// Tier 2 (make-room): no ready cell. Pick a candidate that is currently
+		// occupied by a clearable block but sits on a sturdy floor — Excavating
+		// that one cell turns it into a Tier-1 spot. Caller runs the dig + retries.
+		if (MAKE_ROOM) {
+			for (int dy : Y_OFFSETS) {
+				for (int[] off : SEARCH_ORDER) {
+					BlockPos cand = feet.offset(off[0], dy, off[1]);
+					if (isOpenForPlacement(level, cand)) continue; // Tier-1 territory
+					if (blocksDoorway(level, cand)) continue;
+					if (!isClearable(level.getBlockState(cand).getBlock())) continue;
+					BlockPos below = cand.below();
+					BlockState supportState = level.getBlockState(below);
+					if (!supportState.isFaceSturdy(level, below, Direction.UP)) continue;
+					if (hasFluidNeighbor(level, cand)) continue;
+					return SearchOutcome.clear(cand);
+				}
+			}
+		}
+
 		if (sawDoorAdjacent) {
 			return SearchOutcome.fail(new Failure("blocks_doorway",
 					"every candidate placement would block a nearby door/gate — step away (travel 2-3 blocks) before placing"));
 		}
 		return SearchOutcome.fail(new Failure("no_placeable_spot",
 				"no flat ground within 2 blocks of player (open above, sturdy below) — relocate and retry"));
+	}
+
+	/** True if any of the 6 face-neighbours of {@code pos} holds a fluid (lava/water/waterlogged). */
+	private static boolean hasFluidNeighbor(ClientLevel level, BlockPos pos) {
+		for (Direction d : Direction.values()) {
+			if (!level.getBlockState(pos.relative(d)).getFluidState().isEmpty()) return true;
+		}
+		return false;
 	}
 
 	private static boolean blocksDoorway(ClientLevel level, BlockPos cand) {

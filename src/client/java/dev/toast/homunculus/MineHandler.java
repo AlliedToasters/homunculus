@@ -10,6 +10,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.entity.player.Inventory;
@@ -34,6 +35,32 @@ public final class MineHandler implements HttpHandler {
     private static final long GAME_THREAD_TIMEOUT_MS = 5_000;
     private static final long BOM_PREWARM_TIMEOUT_MS = 30_000;
     private static final int MAX_BODY_BYTES = 4096;
+
+    // No-progress watchdog. While the mine process is active, sample every
+    // PROGRESS_CHECK_INTERVAL_MS: progress = inventory match count increased
+    // OR the player moved >= MOVE_EPS blocks (net) from the last progress
+    // position. If neither happens for MINE_STUCK_THRESHOLD_MS, the target is
+    // present-but-unreachable: Baritone's MineProcess re-paths forever (routine
+    // PathEvent.CANCELED, never CALC_FAILED) and would otherwise burn the full
+    // 45s deadline. Position-movement distinguishes "walking to a far tree"
+    // (keep going) from "oscillating at an unreachable target" (bail).
+    private static final long PROGRESS_CHECK_INTERVAL_MS = 2_000;
+    private static final long MINE_STUCK_THRESHOLD_MS = readStuckThresholdMs();
+    // Net displacement (squared, in blocks) that counts as "still making
+    // travel progress". ~3 blocks: a genuine walk clears this every 2s sample;
+    // oscillation in a tight notch never does.
+    private static final double MOVE_EPS_SQ = 9.0;
+
+    private static long readStuckThresholdMs() {
+        String raw = System.getenv("HOMUNCULUS_MINE_STUCK_THRESHOLD_MS");
+        if (raw == null || raw.isBlank()) return 12_000L;
+        try {
+            long v = Long.parseLong(raw.trim());
+            return v < 1_000L ? 1_000L : v;
+        } catch (NumberFormatException e) {
+            return 12_000L;
+        }
+    }
 
     @Override
     public void handle(HttpExchange exchange) throws IOException {
@@ -160,6 +187,11 @@ public final class MineHandler implements HttpHandler {
         long timeoutMs = Math.min(req.timeoutSeconds, HARD_CAP_SECONDS) * 1000L;
         long deadline = now + timeoutMs;
         boolean wentActive = false;
+        // No-progress watchdog state. Baselined when the mine first goes active.
+        int lastInvCount = preCount;
+        BlockPos lastProgressPos = null;
+        long lastProgressMs = now;
+        long nextProgressCheckMs = now + PROGRESS_CHECK_INTERVAL_MS;
 
         try {
             while (true) {
@@ -174,13 +206,58 @@ public final class MineHandler implements HttpHandler {
                     return Outcome.failure("never_started",
                             "start window elapsed without mineProcess going active");
                 }
-                long wait = (wentActive ? deadline : Math.min(deadline, startDeadline)) - t;
+                long bound = wentActive ? Math.min(deadline, nextProgressCheckMs)
+                                        : Math.min(deadline, startDeadline);
+                long wait = Math.max(0L, bound - t);
                 Signal sig = queue.poll(wait, TimeUnit.MILLISECONDS);
+
+                // No-progress sampling. Runs on the worker thread between polls
+                // (countMatches/playerBlockPos hop to the client thread). A
+                // transient scan exception is treated as progress so we never
+                // bail on a flaky read.
+                if (wentActive && System.currentTimeMillis() >= nextProgressCheckMs) {
+                    long tNow = System.currentTimeMillis();
+                    boolean progressed = false;
+                    try {
+                        int curInv = countMatches(bom);
+                        if (curInv > lastInvCount) {
+                            lastInvCount = curInv;
+                            progressed = true;
+                        }
+                        BlockPos curPos = playerBlockPos();
+                        if (lastProgressPos == null) {
+                            lastProgressPos = curPos;
+                            progressed = true;
+                        } else if (distSq(curPos, lastProgressPos) >= MOVE_EPS_SQ) {
+                            lastProgressPos = curPos;
+                            progressed = true;
+                        }
+                    } catch (Exception e) {
+                        progressed = true;
+                    }
+                    if (progressed) lastProgressMs = tNow;
+                    nextProgressCheckMs = tNow + PROGRESS_CHECK_INTERVAL_MS;
+                    if (tNow - lastProgressMs >= MINE_STUCK_THRESHOLD_MS) {
+                        return Outcome.failure("no_progress",
+                                "no inventory gain + player stationary for " + MINE_STUCK_THRESHOLD_MS
+                                        + "ms — target likely unreachable (have " + lastInvCount
+                                        + " of " + req.count + ")");
+                    }
+                }
+
                 if (sig == null) continue;
 
                 if (sig instanceof TickSignal ts) {
                     if (ts.active) {
-                        wentActive = true;
+                        if (!wentActive) {
+                            // Baseline the watchdog at the moment mining starts so
+                            // the start-window wait doesn't count against progress.
+                            wentActive = true;
+                            long tNow = System.currentTimeMillis();
+                            lastProgressMs = tNow;
+                            nextProgressCheckMs = tNow + PROGRESS_CHECK_INTERVAL_MS;
+                            lastProgressPos = null;
+                        }
                     } else if (wentActive) {
                         // mineProcess deactivated post-start. Inventory check decides whether
                         // the target was actually hit (success) or the process was canceled
@@ -242,6 +319,21 @@ public final class MineHandler implements HttpHandler {
         static Outcome failure(String reason, String message) {
             return new Outcome(false, reason, message);
         }
+    }
+
+    private static BlockPos playerBlockPos() throws Exception {
+        return ClientThread.supply(() -> {
+            LocalPlayer p = Minecraft.getInstance().player;
+            if (p == null) throw new IllegalStateException("no player");
+            return p.blockPosition();
+        }).get(GAME_THREAD_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private static double distSq(BlockPos a, BlockPos b) {
+        double dx = a.getX() - b.getX();
+        double dy = a.getY() - b.getY();
+        double dz = a.getZ() - b.getZ();
+        return dx * dx + dy * dy + dz * dz;
     }
 
     private static int countMatches(BlockOptionalMeta bom) throws Exception {
