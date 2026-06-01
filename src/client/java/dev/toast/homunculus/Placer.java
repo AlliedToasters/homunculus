@@ -37,11 +37,13 @@ import java.util.concurrent.TimeoutException;
  * player toward it for the placement packet. The rotation is left in place — the spectator camera
  * stays on the placed block instead of snapping back to whatever the agent was last facing.
  *
- * Anti-casing precondition: at least {@code RING_1_OPEN_MIN} of the 8 ring-1 tiles around the
- * player's feet must be open (air or replaceable). Default 3, override via env var
- * {@code HOMUNCULUS_RING1_OPEN_MIN} (read at static init). If fewer, return {@code no_space} —
- * placing in a tight pocket walls the agent in. Candidate search prefers ring 2 over ring 1 to
- * give the placed block breathing room away from the player.
+ * Anti-encasement: by default ({@link #ESCAPE_CHECK}) a placement is rejected only if it would
+ * leave the player with zero stepable ring-1 exits, validated per-candidate ({@link #leavesEscape}).
+ * This admits tunnel placements (a 1-wide corridor keeps forward/back open) while still refusing to
+ * seal a true 1-tile pocket. The legacy blanket gate — at least {@code RING_1_OPEN_MIN} of the 8
+ * ring-1 tiles open (default 3, env {@code HOMUNCULUS_RING1_OPEN_MIN}) — is restored by setting
+ * {@code HOMUNCULUS_PLACE_ESCAPE_CHECK=0}. Candidate search prefers ring 2 over ring 1 to give the
+ * placed block breathing room away from the player.
  *
  * Sneak is held through the call so a usable support block (e.g. a chest) doesn't pop its GUI.
  */
@@ -67,6 +69,30 @@ public final class Placer {
 		} catch (NumberFormatException e) {
 			return 3;
 		}
+	}
+
+	/**
+	 * Anti-encasement mode. The legacy {@link #RING_1_OPEN_MIN} gate is a blanket
+	 * pre-search check on ring-1 openness — fast, but it mis-fires underground: a
+	 * 1-wide × 2-tall tunnel has only ~2/8 ring tiles open (forward + back), so the
+	 * gate trips {@code no_space} <em>before the candidate search runs</em>, even
+	 * though placing a block in the corridor ahead never walls the player in. That
+	 * false-positive was the #2 wall-clock sink in the goal=diamond waves.
+	 *
+	 * <p>Escape-check (default on; {@code HOMUNCULUS_PLACE_ESCAPE_CHECK=0} restores
+	 * the blanket gate for A/B) drops the pre-search return and instead validates
+	 * each candidate: a placement is rejected only if it would leave the player with
+	 * <em>zero</em> stepable ring-1 exits (see {@link #leavesEscape}). Tunnel
+	 * placements (forward/back stay open) pass; a true 1-tile pocket (placing the
+	 * cell seals the last exit) is still rejected.
+	 */
+	private static final boolean ESCAPE_CHECK = readEscapeCheck();
+
+	private static boolean readEscapeCheck() {
+		String raw = System.getenv("HOMUNCULUS_PLACE_ESCAPE_CHECK");
+		if (raw == null || raw.isBlank()) return true;
+		String v = raw.trim().toLowerCase(java.util.Locale.ROOT);
+		return !(v.equals("0") || v.equals("false") || v.equals("no"));
 	}
 
 	/**
@@ -324,14 +350,19 @@ public final class Placer {
 
 		BlockPos feet = p.blockPosition();
 
-		int openCount = 0;
-		for (int[] off : RING_1) {
-			if (isOpenForPlacement(level, feet.offset(off[0], 0, off[1]))) openCount++;
-		}
-		if (openCount < RING_1_OPEN_MIN) {
-			return SearchOutcome.fail(new Failure("no_space",
-					"need more space around player; only " + openCount + "/8 adjacent tiles clear (need "
-							+ RING_1_OPEN_MIN + "+) — relocate to open ground"));
+		// Legacy blanket anti-encasement gate — only when escape-check is off.
+		// With escape-check on (default) the per-candidate leavesEscape test below
+		// replaces it, so tunnels are no longer rejected pre-search.
+		if (!ESCAPE_CHECK) {
+			int openCount = 0;
+			for (int[] off : RING_1) {
+				if (isOpenForPlacement(level, feet.offset(off[0], 0, off[1]))) openCount++;
+			}
+			if (openCount < RING_1_OPEN_MIN) {
+				return SearchOutcome.fail(new Failure("no_space",
+						"need more space around player; only " + openCount + "/8 adjacent tiles clear (need "
+								+ RING_1_OPEN_MIN + "+) — relocate to open ground"));
+			}
 		}
 
 		// Doorway guard. Per-candidate: reject if `cand` is itself a door/
@@ -349,6 +380,7 @@ public final class Placer {
 		// down (terrace), then one step up — this recovers slope spawns where the
 		// feet-Y neighbours are into-the-hill or over-the-edge.
 		boolean sawDoorAdjacent = false;
+		boolean sawSealing = false;
 		for (int dy : Y_OFFSETS) {
 			for (int[] off : SEARCH_ORDER) {
 				BlockPos cand = feet.offset(off[0], dy, off[1]);
@@ -359,9 +391,12 @@ public final class Placer {
 				}
 				BlockPos below = cand.below();
 				BlockState supportState = level.getBlockState(below);
-				if (supportState.isFaceSturdy(level, below, Direction.UP)) {
-					return SearchOutcome.ok(cand);
+				if (!supportState.isFaceSturdy(level, below, Direction.UP)) continue;
+				if (ESCAPE_CHECK && !leavesEscape(level, feet, cand)) {
+					sawSealing = true;
+					continue;
 				}
+				return SearchOutcome.ok(cand);
 			}
 		}
 
@@ -379,6 +414,10 @@ public final class Placer {
 					BlockState supportState = level.getBlockState(below);
 					if (!supportState.isFaceSturdy(level, below, Direction.UP)) continue;
 					if (hasFluidNeighbor(level, cand)) continue;
+					if (ESCAPE_CHECK && !leavesEscape(level, feet, cand)) {
+						sawSealing = true;
+						continue;
+					}
 					return SearchOutcome.clear(cand);
 				}
 			}
@@ -388,8 +427,32 @@ public final class Placer {
 			return SearchOutcome.fail(new Failure("blocks_doorway",
 					"every candidate placement would block a nearby door/gate — step away (travel 2-3 blocks) before placing"));
 		}
+		if (sawSealing) {
+			return SearchOutcome.fail(new Failure("no_space",
+					"every reachable placement would seal you in (no ring-1 escape tile left) — step to open ground before placing"));
+		}
 		return SearchOutcome.fail(new Failure("no_placeable_spot",
 				"no flat ground within 2 blocks of player (open above, sturdy below) — relocate and retry"));
+	}
+
+	/**
+	 * Escape-check: would placing at {@code cand} leave the player at least one
+	 * stepable ring-1 exit? An exit is a feet-level cardinal/diagonal cell whose
+	 * foot AND head cells are open for placement (the player is 2 tall). A
+	 * candidate "consumes" an exit only when it lands in that exit's foot cell
+	 * (dy=0) or head cell (dy=+1); a candidate below the exit (dy=-1) or out at
+	 * ring 2 leaves every feet-level exit untouched. True ⇒ placement is safe.
+	 */
+	private static boolean leavesEscape(ClientLevel level, BlockPos feet, BlockPos cand) {
+		for (int[] off : RING_1) {
+			BlockPos foot = feet.offset(off[0], 0, off[1]);
+			BlockPos head = foot.above();
+			if (foot.equals(cand) || head.equals(cand)) continue; // placement seals this exit
+			if (isOpenForPlacement(level, foot) && isOpenForPlacement(level, head)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/** True if any of the 6 face-neighbours of {@code pos} holds a fluid (lava/water/waterlogged). */

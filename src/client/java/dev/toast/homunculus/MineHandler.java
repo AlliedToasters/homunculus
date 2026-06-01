@@ -62,6 +62,23 @@ public final class MineHandler implements HttpHandler {
         }
     }
 
+    // Fix-A diagnostic (default OFF — cannot perturb the brain A/B). When
+    // HOMUNCULUS_MINE_DIAG is truthy, every-sample telemetry is accumulated and
+    // appended to the timeout/no_progress message: cumulative path distance
+    // traversed, net displacement (start->end), inventory gain, active seconds,
+    // and the PathEvent histogram. This classifies a `timeout`:
+    //   path >> net, invGain=0  -> orbiting/never-arriving (effectively unreachable)
+    //   net large, invGain>0     -> descending productively but ran out of clock
+    // The message returns over HTTP -> lands in the agentN rollout log.
+    private static final boolean MINE_DIAG = readMineDiag();
+
+    private static boolean readMineDiag() {
+        String raw = System.getenv("HOMUNCULUS_MINE_DIAG");
+        if (raw == null || raw.isBlank()) return false;
+        String v = raw.trim().toLowerCase(java.util.Locale.ROOT);
+        return v.equals("1") || v.equals("true") || v.equals("yes");
+    }
+
     @Override
     public void handle(HttpExchange exchange) throws IOException {
         try {
@@ -193,14 +210,27 @@ public final class MineHandler implements HttpHandler {
         long lastProgressMs = now;
         long nextProgressCheckMs = now + PROGRESS_CHECK_INTERVAL_MS;
 
+        // Fix-A diagnostic accumulators (only touched when MINE_DIAG).
+        long activeStartMs = 0L;
+        BlockPos diagStartPos = null;
+        BlockPos lastSamplePos = null;
+        double sampledPathDist = 0.0;
+        java.util.EnumMap<PathEvent, Integer> pathCounts = new java.util.EnumMap<>(PathEvent.class);
+
         try {
             while (true) {
                 long t = System.currentTimeMillis();
                 if (t >= deadline) {
-                    return wentActive
-                            ? Outcome.failure("timeout", "deadline elapsed; mine still running")
-                            : Outcome.failure("never_started",
-                                    "start window elapsed without mineProcess going active");
+                    if (!wentActive) {
+                        return Outcome.failure("never_started",
+                                "start window elapsed without mineProcess going active");
+                    }
+                    String tmsg = "deadline elapsed; mine still running";
+                    if (MINE_DIAG) {
+                        tmsg += diagSuffix(activeStartMs, lastInvCount - preCount,
+                                diagStartPos, lastSamplePos, sampledPathDist, pathCounts);
+                    }
+                    return Outcome.failure("timeout", tmsg);
                 }
                 if (!wentActive && t >= startDeadline) {
                     return Outcome.failure("never_started",
@@ -232,16 +262,25 @@ public final class MineHandler implements HttpHandler {
                             lastProgressPos = curPos;
                             progressed = true;
                         }
+                        if (MINE_DIAG) {
+                            if (diagStartPos == null) diagStartPos = curPos;
+                            if (lastSamplePos != null) sampledPathDist += Math.sqrt(distSq(curPos, lastSamplePos));
+                            lastSamplePos = curPos;
+                        }
                     } catch (Exception e) {
                         progressed = true;
                     }
                     if (progressed) lastProgressMs = tNow;
                     nextProgressCheckMs = tNow + PROGRESS_CHECK_INTERVAL_MS;
                     if (tNow - lastProgressMs >= MINE_STUCK_THRESHOLD_MS) {
-                        return Outcome.failure("no_progress",
-                                "no inventory gain + player stationary for " + MINE_STUCK_THRESHOLD_MS
-                                        + "ms — target likely unreachable (have " + lastInvCount
-                                        + " of " + req.count + ")");
+                        String npmsg = "no inventory gain + player stationary for " + MINE_STUCK_THRESHOLD_MS
+                                + "ms — target likely unreachable (have " + lastInvCount
+                                + " of " + req.count + ")";
+                        if (MINE_DIAG) {
+                            npmsg += diagSuffix(activeStartMs, lastInvCount - preCount,
+                                    diagStartPos, lastSamplePos, sampledPathDist, pathCounts);
+                        }
+                        return Outcome.failure("no_progress", npmsg);
                     }
                 }
 
@@ -257,6 +296,7 @@ public final class MineHandler implements HttpHandler {
                             lastProgressMs = tNow;
                             nextProgressCheckMs = tNow + PROGRESS_CHECK_INTERVAL_MS;
                             lastProgressPos = null;
+                            if (MINE_DIAG) activeStartMs = tNow;
                         }
                     } else if (wentActive) {
                         // mineProcess deactivated post-start. Inventory check decides whether
@@ -279,6 +319,7 @@ public final class MineHandler implements HttpHandler {
                                         + " of " + req.count);
                     }
                 } else if (sig instanceof PathSignal p) {
+                    if (MINE_DIAG) pathCounts.merge(p.event, 1, Integer::sum);
                     // Baritone fires PathEvent.CANCELED on routine inter-segment path
                     // transitions during a mine (path A finishes, planner cancels and replans
                     // for the next tree). Only treat CALC_FAILED as terminal — the mine
@@ -327,6 +368,20 @@ public final class MineHandler implements HttpHandler {
             if (p == null) throw new IllegalStateException("no player");
             return p.blockPosition();
         }).get(GAME_THREAD_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Fix-A telemetry suffix. net = straight-line start->end; path = cumulative
+     * sampled traversal; ratio path/net tells wandering (>>1) from descent (~1).
+     */
+    private static String diagSuffix(long activeStartMs, int invGain, BlockPos start,
+                                     BlockPos end, double pathDist, Map<PathEvent, Integer> pathCounts) {
+        long activeS = activeStartMs > 0 ? (System.currentTimeMillis() - activeStartMs) / 1000 : 0;
+        double net = (start != null && end != null) ? Math.sqrt(distSq(start, end)) : 0.0;
+        int dy = (start != null && end != null) ? (end.getY() - start.getY()) : 0;
+        return String.format(java.util.Locale.ROOT,
+                " [diag active=%ds invGain=%d net=%.0f dy=%d path=%.0f pathEvents=%s]",
+                activeS, invGain, net, dy, pathDist, pathCounts);
     }
 
     private static double distSq(BlockPos a, BlockPos b) {
