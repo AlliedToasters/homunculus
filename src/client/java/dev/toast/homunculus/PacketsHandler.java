@@ -11,16 +11,20 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Read-only routes for {@link PacketTap}. Phase 0 of the codec experiment.
+ * Read-only routes for {@link PacketTap} (outbound actions) and
+ * {@link ServerFeedbackTap} (inbound corrective feedback).
  *
  * <ul>
- *   <li>GET /packets/stats — per-class counters + total + uptime.</li>
- *   <li>GET /packets/recent?n=N — last N entries (1..256, default 50).</li>
+ *   <li>GET /packets/stats — outbound per-class counters + total + uptime.</li>
+ *   <li>GET /packets/recent?n=N — last N outbound entries (1..256, default 50).</li>
+ *   <li>GET /packets/feedback — inbound corrective counters (rubberbands,
+ *       motion overrides) + total + uptime. The live rubber-band rate.</li>
+ *   <li>GET /packets/feedback/recent?n=N — last N corrective entries.</li>
  * </ul>
  *
- * <p>Both endpoints are diagnostic: presence of counters proves the mixin
- * fired; the recent ring lets us spot-check the packet distribution while a
- * rollout is running. No mutation surface — this is the observe-only phase.
+ * <p>All endpoints are diagnostic: presence of counters proves the mixins
+ * fired; the recent rings let us spot-check distributions while a rollout is
+ * running. No mutation surface — observe-only.
  */
 public final class PacketsHandler implements HttpHandler {
 
@@ -34,9 +38,8 @@ public final class PacketsHandler implements HttpHandler {
                 return;
             }
             String path = exchange.getRequestURI().getPath();
-            if (path.endsWith("/stats")) {
-                respond(exchange, 200, PacketTap.INSTANCE.statsSnapshot());
-            } else if (path.endsWith("/recent")) {
+            boolean feedback = path.contains("/feedback");
+            if (path.endsWith("/recent")) {
                 int n;
                 try {
                     n = parseN(exchange.getRequestURI());
@@ -44,7 +47,13 @@ public final class PacketsHandler implements HttpHandler {
                     respond(exchange, 400, failure("bad_request", "n must be an integer"));
                     return;
                 }
-                respond(exchange, 200, PacketTap.INSTANCE.recentSnapshot(n));
+                respond(exchange, 200, feedback
+                        ? ServerFeedbackTap.INSTANCE.recentSnapshot(n)
+                        : PacketTap.INSTANCE.recentSnapshot(n));
+            } else if (path.endsWith("/feedback")) {
+                respond(exchange, 200, ServerFeedbackTap.INSTANCE.statsSnapshot());
+            } else if (path.endsWith("/stats")) {
+                respond(exchange, 200, PacketTap.INSTANCE.statsSnapshot());
             } else {
                 respond(exchange, 404, failure("not_found", "unknown packets route: " + path));
             }

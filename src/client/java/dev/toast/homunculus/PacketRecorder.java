@@ -152,10 +152,42 @@ public final class PacketRecorder {
             return;
         }
         Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("dir", "out");
         entry.put("ts_ms", tsMs);
+        entry.put("tick", obs.tickCounter());
         entry.put("id", packetId);
         entry.put("fields", PacketFieldExtractor.extract(packet));
         entry.put("obs", obs.toRecordJson());
+        String line = Json.write(entry);
+        LinkedBlockingQueue<String> q = queue;
+        if (q == null) return; // race with disarm; drop silently
+        if (!q.offer(line)) {
+            droppedQueueFull.incrementAndGet();
+        }
+    }
+
+    /**
+     * Record an inbound corrective-feedback packet (rubber-band / motion
+     * override) from {@link ServerFeedbackTap}, into the same JSONL stream as
+     * outbound actions. Unlike {@link #record}, inbound lines are written even
+     * when no pre-move obs snapshot exists ({@code obs: null}) — a correction is
+     * signal regardless of whether the client has ticked yet — and the join tick
+     * is passed explicitly (receive-time tick, not a pre-move reference frame).
+     *
+     * <p>The fields are pre-extracted by the tap (which also needs them for its
+     * ring + counters) so we don't extract twice. Cheap fast-path when disarmed.
+     */
+    public void recordInbound(Packet<?> packet, String packetId,
+                              Map<String, Object> fields, long tick, long tsMs) {
+        if (!armed) return;
+        PlayerObsSnapshot.Snapshot obs = PlayerObsSnapshot.latest();
+        Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("dir", "in");
+        entry.put("ts_ms", tsMs);
+        entry.put("tick", tick);
+        entry.put("id", packetId);
+        entry.put("fields", fields);
+        entry.put("obs", obs == null ? null : obs.toRecordJson());
         String line = Json.write(entry);
         LinkedBlockingQueue<String> q = queue;
         if (q == null) return; // race with disarm; drop silently

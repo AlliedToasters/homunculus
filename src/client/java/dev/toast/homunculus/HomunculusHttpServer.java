@@ -64,6 +64,12 @@ public final class HomunculusHttpServer {
 		PacketsHandler packetsHandler = new PacketsHandler();
 		server.createContext("/packets/stats", packetsHandler);
 		server.createContext("/packets/recent", packetsHandler);
+		// Inbound corrective-feedback tap (InboundPacketMixin → ServerFeedbackTap):
+		// the server's rubber-band position corrections + player motion overrides.
+		// Live rubber-band rate for sweep observation; recorded into the same
+		// JSONL as outbound actions when a recording is armed (offline join).
+		server.createContext("/packets/feedback", packetsHandler);
+		server.createContext("/packets/feedback/recent", packetsHandler);
 		// Phase 1: byte round-trip kill switch + counters. POST {"enabled":bool}
 		// flips the global flag; the mixin checks it per outbound packet.
 		server.createContext("/packets/roundtrip", new PacketRoundtripHandler());
