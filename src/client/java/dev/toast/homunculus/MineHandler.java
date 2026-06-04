@@ -16,6 +16,7 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -171,6 +172,26 @@ public final class MineHandler implements HttpHandler {
                             + " (target " + req.count + ")");
         }
 
+        // Tool pre-check (issue #11): a block that requires a correct tool for
+        // drops, mined with no such tool in inventory, breaks for ~nothing —
+        // AutoTool falls back to an inert item, the break is glacial, and no
+        // item drops. Don't even start Baritone; fail fast so the agent
+        // re-crafts a pickaxe instead of burning the whole deadline barehanded.
+        boolean toolGated;
+        try {
+            int tv = toolViability(block);
+            toolGated = tv != 0;
+            if (tv == 2) {
+                return Outcome.failure("no_effective_tool",
+                        "no correct tool (pickaxe of sufficient tier) in inventory for "
+                                + req.block + " — it requires one to drop anything; "
+                                + "craft/upgrade a pickaxe and retry");
+            }
+        } catch (Exception e) {
+            return Outcome.failure("internal_error",
+                    "tool pre-check threw: " + rootMessage(e));
+        }
+
         LinkedBlockingQueue<Signal> queue = new LinkedBlockingQueue<>();
         AtomicBoolean closed = new AtomicBoolean(false);
 
@@ -272,6 +293,25 @@ public final class MineHandler implements HttpHandler {
                     }
                     if (progressed) lastProgressMs = tNow;
                     nextProgressCheckMs = tNow + PROGRESS_CHECK_INTERVAL_MS;
+                    // Mid-mine tool check (issue #11): the pickaxe can snap
+                    // mid-turn (passed the pre-check, then broke). Catch it on
+                    // the same 2s cadence and bail immediately rather than
+                    // grinding barehanded until the no-progress/deadline wall.
+                    if (toolGated) {
+                        int tv;
+                        try {
+                            tv = toolViability(block);
+                        } catch (Exception e) {
+                            tv = 1; // flaky read — assume still ok; never bail on a hiccup
+                        }
+                        if (tv == 2) {
+                            return Outcome.failure("no_effective_tool",
+                                    "effective tool lost mid-mine for " + req.block
+                                            + " (pickaxe broke?) — have " + lastInvCount
+                                            + " of " + req.count
+                                            + "; craft/upgrade a pickaxe and retry");
+                        }
+                    }
                     if (tNow - lastProgressMs >= MINE_STUCK_THRESHOLD_MS) {
                         String npmsg = "no inventory gain + player stationary for " + MINE_STUCK_THRESHOLD_MS
                                 + "ms — target likely unreachable (have " + lastInvCount
@@ -389,6 +429,29 @@ public final class MineHandler implements HttpHandler {
         double dy = a.getY() - b.getY();
         double dz = a.getZ() - b.getZ();
         return dx * dx + dy * dy + dz * dz;
+    }
+
+    /**
+     * Tool viability for issue #11. Result codes:
+     *   0 = block doesn't require a correct tool for drops (any/no tool works — viable)
+     *   1 = requires a correct tool AND the inventory holds a correct one (viable)
+     *   2 = requires a correct tool AND the inventory holds NONE (futile — bail)
+     * isCorrectToolForDrops is tier-aware: a wooden pickaxe is "incorrect" for
+     * diamond ore, so this also catches wrong-tier mining (no drop).
+     */
+    private static int toolViability(Block block) throws Exception {
+        return ClientThread.supply(() -> {
+            BlockState state = block.defaultBlockState();
+            if (!state.requiresCorrectToolForDrops()) return 0;
+            LocalPlayer p = Minecraft.getInstance().player;
+            if (p == null) throw new IllegalStateException("no player");
+            Inventory inv = p.getInventory();
+            for (int i = 0; i < inv.getContainerSize(); i++) {
+                ItemStack stack = inv.getItem(i);
+                if (!stack.isEmpty() && stack.isCorrectToolForDrops(state)) return 1;
+            }
+            return 2;
+        }).get(GAME_THREAD_TIMEOUT_MS, TimeUnit.MILLISECONDS);
     }
 
     private static int countMatches(BlockOptionalMeta bom) throws Exception {
