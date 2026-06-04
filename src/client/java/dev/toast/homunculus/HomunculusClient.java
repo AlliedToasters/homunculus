@@ -23,6 +23,7 @@ public final class HomunculusClient implements ClientModInitializer {
 		WaterAversion.register();
 		ShearReflex.register();
 		AutoShears.register();
+		TickBreaker.register();
 		PlayerObsSnapshot.register();
 		// MUST come after PlayerObsSnapshot.register(): the sidecar reads
 		// PlayerObsSnapshot.currentTick() at END_CLIENT_TICK and Fabric fires

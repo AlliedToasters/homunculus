@@ -42,6 +42,11 @@ public final class HomunculusHttpServer {
 		server.createContext("/bed/place", new BedPlaceHandler());
 		server.createContext("/bed/sleep", new SleepHandler());
 		server.createContext("/shear/sheep", new ShearHandler());
+		// /harvest_bamboo: direct bamboo harvest (Baritone can't — bug #4653).
+		// Breaks each bamboo column's ground-level base (cascades the column) so
+		// the stationary player vacuums the drops. The mine_wood bamboo-jungle
+		// fallback routes here instead of /baritone/mine.
+		server.createContext("/harvest_bamboo", new HarvestBambooHandler());
 		// /attack_entity: melee-attack one entity chosen by UUID (from /scan_entities).
 		// Injection path for the neural target-selector (neural_interface.md §13.1) —
 		// rotate + gameMode.attack + swing the chosen target; no KillAura auto-aim needed.
